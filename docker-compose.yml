@@ -1,0 +1,32 @@
+# Postgres and Qdrant only. The API runs on the host (uvicorn --reload) for a
+# fast edit loop; it gets containerised at the very end of the project.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: docintel
+      POSTGRES_PASSWORD: docintel_dev_only_change_me
+      POSTGRES_DB: docintel
+    ports:
+      - "5433:5432"
+    volumes:
+      - docintel_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docintel -d docintel"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - docintel_qdrant_data:/qdrant/storage
+
+volumes:
+  docintel_pg_data:
+  docintel_qdrant_data:
