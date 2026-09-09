@@ -42,6 +42,35 @@ def test_chat_request_rejects_history_over_limit():
         )
 
 
+async def test_chat_works_with_no_history_field():
+    # send_message's `history` parameter defaults to None -> [] and every
+    # call site below this omits it entirely, the same way every pre-existing
+    # test in this file already does — this just names that guarantee
+    # explicitly: omitting `history` is not a degraded path.
+    llm = FakeLLMClient(response="Employees may work remotely. [S1]")
+
+    async with async_session_factory() as db:
+        result = await chat_service.send_message(
+            db,
+            llm,
+            query="What is the remote work policy?",
+            conversation_id=None,
+            top_k=None,
+            rerank_enabled=None,
+            document_ids=None,
+        )
+
+    assert result["conversation_id"]
+    assert result["message_id"]
+    assert result["answer"]
+
+    conv_id = uuid.UUID(result["conversation_id"])
+    async with async_session_factory() as db:
+        conv = await db.get(Conversation, conv_id)
+        await db.delete(conv)
+        await db.commit()
+
+
 @pytest.fixture(autouse=True)
 async def _require_live_services_and_documents():
     if not (await ping_db() and await ping_qdrant()):
