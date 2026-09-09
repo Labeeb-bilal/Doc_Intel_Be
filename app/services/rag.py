@@ -13,13 +13,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.llm import LLMClient
 from app.config import get_settings
-from app.prompts.answer import ANSWER_SYSTEM_PROMPT, build_context_block, build_user_message, format_source_label
+from app.prompts.answer import ANSWER_SYSTEM_PROMPT, build_context_block, build_user_prompt, format_source_label
 from app.schemas import (
     AnswerStage,
     Citation,
     ContextStage,
     ContradictionGroupOut,
     ContradictionStage,
+    HistoryMessage,
     RetrievalResult,
     ScoredChunk,
 )
@@ -113,7 +114,7 @@ def _validate_citations(answer_text: str, source_map: dict[str, ScoredChunk]) ->
     return cleaned, citations, dropped
 
 
-async def _generate_answer(llm: LLMClient, result: RetrievalResult) -> dict:
+async def _generate_answer(llm: LLMClient, result: RetrievalResult, history: list[HistoryMessage]) -> dict:
     settings = get_settings()
     overall_start = time.perf_counter()
 
@@ -127,7 +128,7 @@ async def _generate_answer(llm: LLMClient, result: RetrievalResult) -> dict:
         truncated=truncated,
     )
 
-    user_message = build_user_message(query=result.query, context_block=context_block)
+    user_message = build_user_prompt(history=history, context=context_block, query=result.query)
 
     answer_start = time.perf_counter()
     raw_answer = await llm.complete(system=ANSWER_SYSTEM_PROMPT, user=user_message)
@@ -193,14 +194,16 @@ async def _run_contradiction_branch(
     return groups, stage
 
 
-async def _answer_with_contradictions(llm: LLMClient, result: RetrievalResult, db: AsyncSession) -> dict:
+async def _answer_with_contradictions(
+    llm: LLMClient, result: RetrievalResult, db: AsyncSession, history: list[HistoryMessage]
+) -> dict:
     """The execution model: two branches run concurrently off the same
     RetrievalResult, neither gates the other. return_exceptions=True is
     mandatory — a contradiction failure must never cancel the answer."""
     settings = get_settings()
 
     answer_outcome, contradiction_outcome = await asyncio.gather(
-        _generate_answer(llm, result),
+        _generate_answer(llm, result, history),
         _run_contradiction_branch(db, llm, result),
         return_exceptions=True,
     )
@@ -256,6 +259,7 @@ async def answer(
     *,
     db: AsyncSession | None = None,
     detect_contradictions: bool = False,
+    history: list[HistoryMessage] | None = None,
 ) -> dict:
     """Single entry point. Decides whether to call the LLM at all, mutates
     result.trace in place (context/answer/contradiction_check/total_ms),
@@ -265,9 +269,14 @@ async def answer(
     `db` and `detect_contradictions` are optional so existing callers
     (and the phase-two test suite) that only want an answer keep working
     unchanged — contradiction detection only forks when both are supplied.
+    `history` is likewise optional and defaults to none: conversational
+    context for the answer LLM's prompt, never for retrieval — the caller
+    (services/chat.py) sources it straight from the request body, never a
+    DB read.
     """
+    history = history or []
     if not result.selected:
         return _not_found_result(result)
     if db is not None and detect_contradictions:
-        return await _answer_with_contradictions(llm, result, db)
-    return await _generate_answer(llm, result)
+        return await _answer_with_contradictions(llm, result, db, history)
+    return await _generate_answer(llm, result, history)

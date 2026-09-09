@@ -7,6 +7,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 
 from app.adapters.llm import LLMUnavailableError
@@ -14,9 +15,31 @@ from app.adapters.vectors import ping_qdrant
 from app.db import async_session_factory, ping_db
 from app.errors import AppError, NotFoundError
 from app.models import Conversation, Document
-from app.schemas import RetrievalTrace, RetrievalTraceSummary
+from app.schemas import ChatRequest, RetrievalTrace, RetrievalTraceSummary
 from app.services import chat as chat_service
 from tests.fakes import FakeLLMClient
+
+
+def test_chat_request_rejects_assistant_history():
+    # No TestClient/`client` fixture exists in this suite (every test here
+    # calls services directly against live infra) — this is the equivalent
+    # unit-level check for what FastAPI's 422 translation actually rests
+    # on: role: Literal["user"] on HistoryMessage rejects anything else at
+    # the schema boundary, before any service code runs.
+    with pytest.raises(ValidationError):
+        ChatRequest(query="follow up", history=[{"role": "assistant", "content": "previous answer"}])
+
+
+def test_chat_request_rejects_history_over_limit():
+    with pytest.raises(ValidationError):
+        ChatRequest(
+            query="follow up",
+            history=[
+                {"role": "user", "content": "q1"},
+                {"role": "user", "content": "q2"},
+                {"role": "user", "content": "q3"},  # over the max_length=2 cap
+            ],
+        )
 
 
 @pytest.fixture(autouse=True)

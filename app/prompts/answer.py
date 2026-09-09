@@ -2,6 +2,8 @@
 wording can change without touching pipeline logic."""
 from __future__ import annotations
 
+from app.schemas import HistoryMessage
+
 ANSWER_SYSTEM_PROMPT = """You are a document assistant. You answer questions using ONLY the numbered sources given below the user's question.
 
 Rules:
@@ -30,7 +32,20 @@ def build_context_block(labeled_sources: list[str]) -> str:
     return "\n\n".join(labeled_sources)
 
 
-def build_user_message(*, query: str, context_block: str) -> str:
-    if not context_block:
-        return f"Question: {query}"
-    return f"{context_block}\n\nQuestion: {query}"
+def build_user_prompt(*, history: list[HistoryMessage], context: str, query: str) -> str:
+    """Conversational context lives here, in the prompt — never in the
+    retrieval query (services/retrieval.py always embeds `query` alone).
+    `history` is the last up-to-2 user turns the frontend already holds in
+    state; no DB read feeds this. Question(s) first, then sources: with no
+    history this degrades to exactly "Current question: ...\\n\\nSources:
+    ...", so an ordinary first turn's prompt shape doesn't change."""
+    lines: list[str] = []
+    for msg in history:
+        lines.append(f"Previous question: {msg.content}")
+    if lines:
+        lines.append("")  # blank line separator before current question
+    lines.append(f"Current question: {query}")
+    lines.append("")
+    lines.append("Sources:")
+    lines.append(context)
+    return "\n".join(lines)

@@ -1,9 +1,12 @@
 """Stage 3 checkpoint + spec tests #1/#2: citation validation (including
 the grouped-citation form real models actually produce) and the relevance
-floor skipping the LLM entirely. Fully offline via FakeLLMClient."""
+floor skipping the LLM entirely. Also covers build_user_prompt (the
+answer-LLM's conversational-history prompt shape — history reaches the
+prompt only, never retrieval). Fully offline via FakeLLMClient."""
 from __future__ import annotations
 
-from app.schemas import RetrievalResult, RetrievalStage, RetrievalTrace, ScoredChunk
+from app.prompts.answer import build_user_prompt
+from app.schemas import HistoryMessage, RetrievalResult, RetrievalStage, RetrievalTrace, ScoredChunk
 from app.services import rag
 from tests.fakes import FakeLLMClient
 
@@ -33,6 +36,20 @@ def _make_result(selected: list[ScoredChunk], query: str = "some question") -> R
         retrieval=RetrievalStage(top_k=20, returned=len(selected), latency_ms=10, candidates=[]),
     )
     return RetrievalResult(query=query, candidates=selected, selected=selected, trace=trace)
+
+
+def test_build_user_prompt_with_history():
+    history = [HistoryMessage(role="user", content="What is the expense threshold?")]
+    result = build_user_prompt(history=history, context="[S1] policy text...", query="What about in Europe?")
+    assert "Previous question: What is the expense threshold?" in result
+    assert "Current question: What about in Europe?" in result
+    assert result.index("Previous question") < result.index("Current question")
+
+
+def test_build_user_prompt_no_history():
+    result = build_user_prompt(history=[], context="[S1] text...", query="What is the timeout?")
+    assert "Previous question" not in result
+    assert "Current question: What is the timeout?" in result
 
 
 async def test_hallucinated_citation_is_dropped_and_counted():

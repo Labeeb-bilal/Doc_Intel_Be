@@ -278,9 +278,23 @@ class ChatOptions(BaseModel):
     detect_contradictions: bool = True
 
 
+class HistoryMessage(BaseModel):
+    """Conversational context for the answer LLM's prompt only — never for
+    retrieval (services/retrieval.py always embeds the raw query alone) and
+    never read back from the DB (the frontend sends the last 2 user turns
+    it already holds in state). `role` is deliberately Literal["user"], not
+    ["user", "assistant"]: assistant turns are not accepted here, and
+    Pydantic rejects them with 422 rather than the service silently
+    filtering them out."""
+
+    role: Literal["user"]
+    content: str
+
+
 class ChatRequest(BaseModel):
     query: str
     conversation_id: uuid.UUID | None = None
+    history: list[HistoryMessage] = Field(default_factory=list, max_length=2)
     options: ChatOptions | None = None
 
 

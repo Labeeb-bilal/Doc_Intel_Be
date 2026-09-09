@@ -13,7 +13,7 @@ from app.adapters.llm import LLMClient, LLMUnavailableError, get_llm_client
 from app.config import get_settings
 from app.errors import AppError, NotFoundError
 from app.models import Conversation, Document, Message
-from app.schemas import RetrievalTrace, summarize_trace
+from app.schemas import HistoryMessage, RetrievalTrace, summarize_trace
 from app.services import rag
 from app.services.retrieval import retrieve
 
@@ -21,16 +21,6 @@ log = structlog.get_logger("chat")
 
 _TITLE_MAX_LEN = 80
 _MAX_QUERY_CHARS = 2000
-
-
-async def _previous_user_message(db: AsyncSession, conversation_id: uuid.UUID) -> str | None:
-    stmt = (
-        select(Message.content)
-        .where(Message.conversation_id == conversation_id, Message.role == "user")
-        .order_by(Message.created_at.desc())
-        .limit(1)
-    )
-    return await db.scalar(stmt)
 
 
 async def send_message(
@@ -43,7 +33,9 @@ async def send_message(
     rerank_enabled: bool | None,
     document_ids: list[str] | None,
     detect_contradictions: bool = True,
+    history: list[HistoryMessage] | None = None,
 ) -> dict:
+    history = history or []
     query = query.strip()
     if not query:
         raise AppError("Query must not be empty.", code="EMPTY_QUERY", status_code=422)
@@ -75,12 +67,10 @@ async def send_message(
         conversation = await db.get(Conversation, conversation_id)
         if conversation is None:
             raise NotFoundError(f"Conversation {conversation_id} not found.", code="CONVERSATION_NOT_FOUND")
-        previous_user_message = await _previous_user_message(db, conversation_id)
     else:
         conversation = Conversation(title=query[:_TITLE_MAX_LEN])
         db.add(conversation)
         await db.flush()  # populate conversation.id without committing yet
-        previous_user_message = None
 
     try:
         # Resolving the real client here (not in the route) means a
@@ -89,12 +79,13 @@ async def send_message(
         # envelope instead of two.
         llm = llm or get_llm_client()
 
-        # Retrieval runs exactly once; rag.answer() mutates result.trace in
-        # place (context/answer/total_ms) and decides whether to call the
-        # LLM at all.
+        # Retrieval runs exactly once, on the raw query alone — no
+        # conversational history feeds this. rag.answer() mutates
+        # result.trace in place (context/answer/total_ms) and decides
+        # whether to call the LLM at all; `history` reaches the LLM prompt
+        # through it, not through retrieval.
         result = await retrieve(
             query,
-            previous_user_message=previous_user_message,
             top_k=top_k,
             rerank_enabled=rerank_enabled,
             document_ids=document_ids,
@@ -104,6 +95,7 @@ async def send_message(
             llm,
             result,
             db=db,
+            history=history,
             detect_contradictions=detect_contradictions and settings.contradiction_enabled,
         )
     except LLMUnavailableError as exc:
