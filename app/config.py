@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     # Applies to the sigmoid-normalised rerank score when reranking is on,
     # and to raw cosine similarity when it's off — not the same scale, so
     # changing RERANK_ENABLED can require re-tuning this value.
-    relevance_floor: float = Field(default=0.3)
+    relevance_floor: float = Field(default=0.15)
     neighbour_expansion: bool = Field(default=True)
     max_context_tokens: int = Field(default=6000)
 
