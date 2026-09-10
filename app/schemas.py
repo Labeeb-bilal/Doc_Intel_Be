@@ -66,16 +66,6 @@ class StatsResponse(BaseModel):
     embedding_model: str
 
 
-# ---------------------------------------------------------------------------
-# Phase two: retrieval + RAG + chat
-#
-# ScoredChunk / RetrievalResult are the central contract of this phase.
-# Retrieval runs exactly once per request; every consumer (the answer path
-# now, the contradiction-detection path next phase) reads this same object,
-# so they can never disagree about what was retrieved.
-# ---------------------------------------------------------------------------
-
-
 class ScoredChunk(BaseModel):
     chunk_id: str
     document_id: str
@@ -85,7 +75,7 @@ class ScoredChunk(BaseModel):
     page_end: int | None
     section_path: list[str]
     ordinal: int
-    vector: list[float] | None = None  # kept for the next phase (contradiction pairing)
+    vector: list[float] | None = None
     vector_score: float
     rerank_score: float | None = None
     rank_before: int
@@ -118,7 +108,7 @@ class RerankResultEntry(BaseModel):
     rerank_score: float
     rank_before: int
     rank_after: int
-    rank_delta: int  # positive = moved up (more relevant than cosine alone suggested)
+    rank_delta: int
     used_in_answer: bool
 
 
@@ -128,8 +118,8 @@ class RerankStage(BaseModel):
     kept: int
     latency_ms: int
     results: list[RerankResultEntry] = []
-    dropped: list[str] = []  # chunk_ids that didn't clear the floor
-    error: str | None = None  # set when the reranker failed and we fell back to vector order
+    dropped: list[str] = []
+    error: str | None = None
 
 
 class RetrievalStageSummary(BaseModel):
@@ -152,7 +142,7 @@ class RerankStageSummary(BaseModel):
 
 
 class ContextStage(BaseModel):
-    chunks_used: list[str]  # chunk_ids in the final prompt, in [Sn] order
+    chunks_used: list[str]
     neighbour_expansion: bool
     total_tokens: int
     truncated: bool
@@ -161,7 +151,7 @@ class ContextStage(BaseModel):
 class AnswerStage(BaseModel):
     model: str
     latency_ms: int
-    citations: list[str]  # markers actually rendered, e.g. ["S1", "S2"]
+    citations: list[str]
     citations_dropped: int
     grounded: bool
 
@@ -173,9 +163,6 @@ class RetrievalTrace(BaseModel):
     condensed: bool
     retrieval: RetrievalStage
     rerank: RerankStage | None = None
-    # context / answer / total_ms are filled in by services/rag.py once the
-    # LLM step runs — services/retrieval.py never calls the LLM, so it can
-    # only produce a partial trace.
     context: ContextStage | None = None
     answer: AnswerStage | None = None
     contradiction_check: "ContradictionStage | None" = None
@@ -255,19 +242,19 @@ def summarize_trace(trace: RetrievalTrace) -> RetrievalTraceSummary:
 
 
 class Citation(BaseModel):
-    marker: str  # "S1"
+    marker: str
     chunk_id: str
     document_id: str
     document_name: str
     page: int | None
-    section: str | None  # section_path joined with " > "
+    section: str | None
     text: str
 
 
 class RetrievalResult(BaseModel):
     query: str
-    candidates: list[ScoredChunk]  # everything retrieved, pre-narrowing
-    selected: list[ScoredChunk]  # what actually reaches the prompt
+    candidates: list[ScoredChunk]
+    selected: list[ScoredChunk]
     trace: RetrievalTrace
 
 
@@ -304,7 +291,7 @@ class ChatResponse(BaseModel):
     answer: str
     citations: list[Citation]
     contradictions: list["ContradictionGroupOut"] = []
-    contradictions_total: int = 0  # number of distinct groups, not raw pairwise records
+    contradictions_total: int = 0
     trace: RetrievalTraceSummary
     grounded: bool
 
@@ -337,20 +324,15 @@ class ConversationMessagesResponse(BaseModel):
     messages: list[MessageOut]
 
 
-# ---------------------------------------------------------------------------
-# Phase three: contradiction detection
-# ---------------------------------------------------------------------------
-
-
 class ContradictionVerdict(BaseModel):
     pair_id: str
     is_contradiction: bool
     type: Literal["factual", "logical", "numerical", "temporal", "none"]
     severity: Literal["critical", "warning", "info"]
-    confidence: float  # 0.0 - 1.0
-    statement_a: str  # verbatim span from chunk A
-    statement_b: str  # verbatim span from chunk B
-    explanation: str  # 1-2 sentences shown to the user
+    confidence: float
+    statement_a: str
+    statement_b: str
+    explanation: str
     reconciliation: Literal["supersedes", "scope_difference", "none"]
 
 
@@ -364,9 +346,6 @@ class PairDecision(BaseModel):
     cosine: float | None
     accepted: bool
     reason: str
-    # same_document | similarity_below_threshold | near_duplicate
-    # numeric_exempt | false_positive_suppressed | cached_verdict
-    # over_pair_limit | accepted
 
 
 class ContradictionStage(BaseModel):
@@ -507,8 +486,8 @@ class ContradictionRecordOut(BaseModel):
 
 class ContradictionListResponse(BaseModel):
     contradictions: list[ContradictionGroupOut]
-    counts: dict[str, int]  # global pairwise-record tallies (open/resolved/false_positive), unaffected by grouping
-    total: int  # number of distinct GROUPS (post-dedup), not raw pairwise rows
+    counts: dict[str, int]
+    total: int
     limit: int
     offset: int
 

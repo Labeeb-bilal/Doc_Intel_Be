@@ -25,7 +25,7 @@ class Block:
     """Format-agnostic intermediate the chunker consumes."""
 
     text: str
-    page: int | None  # None for DOCX, MD, TXT
+    page: int | None
     section_path: list[str] = field(default_factory=list)
     ordinal: int = 0
 
@@ -61,10 +61,8 @@ class EncodingFailedError(ExtractionError):
     code = "ENCODING_FAILED"
 
 
-# --- TXT -------------------------------------------------------------------
-
 _BLANK_LINE_RE = re.compile(r"\n\s*\n+")
-_TXT_PART_SIZE = 30  # blocks per "Part N" anchor, so citations always have somewhere to point
+_TXT_PART_SIZE = 30
 
 
 def extract_txt(data: bytes, *, metadata: dict | None = None) -> Iterator[Block]:
@@ -93,10 +91,8 @@ def extract_txt(data: bytes, *, metadata: dict | None = None) -> Iterator[Block]
         yield Block(text=paragraph, page=None, section_path=[f"Part {part}"], ordinal=ordinal)
 
 
-# --- PDF ---------------------------------------------------------------
-
 _HYPHEN_BREAK_RE = re.compile(r"-\n(?=[a-z])")
-_MIN_CHARS_PER_PAGE_FOR_TEXT_LAYER = 50  # below this, it's almost certainly a scanned image
+_MIN_CHARS_PER_PAGE_FOR_TEXT_LAYER = 50
 
 
 def _normalize_pdf_page_text(lines: list[str]) -> str:
@@ -104,7 +100,7 @@ def _normalize_pdf_page_text(lines: list[str]) -> str:
     while preserving genuine blank-line paragraph breaks."""
     joined = "\n".join(lines)
     joined = _HYPHEN_BREAK_RE.sub("", joined)
-    joined = re.sub(r"\n\s*\n+", " ", joined)  # protect paragraph breaks
+    joined = re.sub(r"\n\s*\n+", " ", joined)
     joined = joined.replace("\n", " ")
     joined = joined.replace(" ", "\n\n")
     return re.sub(r"[ \t]+", " ", joined).strip()
@@ -173,8 +169,6 @@ def extract_pdf(data: bytes, *, metadata: dict | None = None) -> Iterator[Block]
         pdf.close()
 
 
-# --- DOCX ----------------------------------------------------------------
-
 _DOCX_HEADING_STYLE_RE = re.compile(r"^heading\s*(\d)$", re.IGNORECASE)
 
 
@@ -202,9 +196,6 @@ def _docx_heading_level(paragraph) -> int | None:
         if match:
             return int(match.group(1))
 
-    # Fallback for renamed styles in custom templates: an outline level can
-    # be set directly on the paragraph, or inherited from its style — check
-    # both. Word's outline levels are 0-indexed (0 -> Heading level 1).
     level = _docx_outline_level(paragraph._p)
     if level is None and paragraph.style is not None:
         level = _docx_outline_level(paragraph.style.element)
@@ -262,8 +253,6 @@ def extract_docx(data: bytes, *, metadata: dict | None = None) -> Iterator[Block
     if not any_content:
         raise EmptyDocumentError("The DOCX file contains no extractable text.")
 
-
-# --- Markdown --------------------------------------------------------------
 
 _MD_FENCE_RE = re.compile(r"^(```|~~~)")
 _MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")

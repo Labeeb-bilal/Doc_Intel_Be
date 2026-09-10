@@ -41,7 +41,7 @@ async def _make_real_chunk(db, *, text: str, vector: list[float]) -> ScoredChunk
     await db.flush()
 
     chunk = Chunk(
-        id=uuid.uuid4(),  # no Python-side default: normally == the Qdrant point id, irrelevant for this fixture
+        id=uuid.uuid4(),
         document_id=document.id,
         ordinal=0,
         page_start=1,
@@ -73,7 +73,7 @@ async def _cleanup_document(document_id: str) -> None:
     async with async_session_factory() as db:
         doc = await db.get(Document, uuid.UUID(document_id))
         if doc is not None:
-            await db.delete(doc)  # cascades to chunks and contradictions
+            await db.delete(doc)
             await db.commit()
 
 
@@ -114,9 +114,6 @@ def _batch_with_one_contradiction(pair_id: str = "P1") -> ContradictionBatch:
     )
 
 
-# --- Test #5: cache behaviour ------------------------------------------------
-
-
 async def test_repeat_detection_reuses_cache_increments_times_seen_zero_llm_calls():
     async with async_session_factory() as db:
         chunk_a = await _make_real_chunk(db, text="The fee is $50 per transaction.", vector=[1.0, 0.0, 0.0])
@@ -140,18 +137,15 @@ async def test_repeat_detection_reuses_cache_increments_times_seen_zero_llm_call
                 db, llm, [chunk_a, chunk_b], "q2", sim_min=0.5, sim_max=0.97, max_pairs=8, min_confidence=0.5
             )
 
-        assert stage_2.llm_calls == 0  # fully cached this time
+        assert stage_2.llm_calls == 0
         assert stage_2.cached_verdicts == 1
         assert len(found_2) == 1
-        assert found_2[0].times_seen == 2  # incremented on reuse
+        assert found_2[0].times_seen == 2
         structured_calls_after_second = len([c for c in llm.calls if c["kind"] == "structured"])
-        assert structured_calls_after_second == structured_calls_after_first  # no new LLM call
+        assert structured_calls_after_second == structured_calls_after_first
     finally:
         await _cleanup_document(chunk_a.document_id)
         await _cleanup_document(chunk_b.document_id)
-
-
-# --- Test #6: status preservation --------------------------------------------
 
 
 async def test_resolved_status_is_not_reset_on_rediscovery():
@@ -173,23 +167,18 @@ async def test_resolved_status_is_not_reset_on_rediscovery():
         assert resolved.status == "resolved"
         assert resolved.resolved_at is not None
 
-        # Re-detect the SAME pair — new detect_contradictions call, as if
-        # the same query (or an overlapping one) ran again.
         async with async_session_factory() as db:
             found_again, stage_again = await cx.detect_contradictions(
                 db, llm, [chunk_a, chunk_b], "q2", sim_min=0.5, sim_max=0.97, max_pairs=8, min_confidence=0.5
             )
 
-        assert stage_again.llm_calls == 0  # resolved pairs are still cached/reusable, not re-adjudicated
+        assert stage_again.llm_calls == 0
         assert len(found_again) == 1
-        assert found_again[0].status == "resolved"  # status was NOT reset back to "open"
+        assert found_again[0].status == "resolved"
         assert found_again[0].times_seen == 2
     finally:
         await _cleanup_document(chunk_a.document_id)
         await _cleanup_document(chunk_b.document_id)
-
-
-# --- Test #7: degradation -----------------------------------------------------
 
 
 def _make_result(selected: list[ScoredChunk], query: str = "some question") -> RetrievalResult:
@@ -218,8 +207,6 @@ async def test_contradiction_engine_exception_still_returns_complete_answer(monk
     async with async_session_factory() as db:
         outcome = await rag.answer(llm, result, db=db, detect_contradictions=True)
 
-    # The answer branch has no condition — it must come back complete and
-    # untouched even though the contradiction branch raised.
     assert outcome["answer"] == "This is the grounded answer. [S1]"
     assert outcome["grounded"] is True
     assert outcome["contradictions"] == []
@@ -227,10 +214,6 @@ async def test_contradiction_engine_exception_still_returns_complete_answer(monk
     assert result.trace.contradiction_check is not None
     assert result.trace.contradiction_check.enabled is False
     assert "contradiction engine exploded" in result.trace.contradiction_check.error
-
-
-# --- Regression: LLM failure inside detect_contradictions must preserve --
-# --- real pipeline counts, not report pairs_generated=0 / enabled=false --
 
 
 class _RateLimitedStructuredLLM:
@@ -265,10 +248,6 @@ async def test_llm_failure_inside_detection_preserves_real_pair_counts():
                 db, llm, [chunk_a, chunk_b], "q1", sim_min=0.5, sim_max=0.999, max_pairs=8, min_confidence=0.5
             )
 
-        # The bug: these used to come back as 0/False because the whole
-        # function raised and rag.py's outer catch zeroed everything out.
-        # Pair formation and cosine filtering genuinely ran and produced
-        # real numbers — they must survive an LLM-specific failure.
         assert stage.enabled is True
         assert stage.pairs_generated == 1
         assert stage.pairs_after_same_doc_filter == 1
@@ -276,7 +255,7 @@ async def test_llm_failure_inside_detection_preserves_real_pair_counts():
         assert stage.llm_calls == 1
         assert stage.error is not None
         assert stage.error.startswith("LLM rate limited:")
-        assert found == []  # nothing was cached before, so nothing to return today
+        assert found == []
     finally:
         await _cleanup_document(chunk_a.document_id)
         await _cleanup_document(chunk_b.document_id)
@@ -290,7 +269,6 @@ async def test_llm_failure_still_returns_previously_cached_contradictions():
     working_llm = FakeLLMClient(structured_response=_batch_with_one_contradiction())
 
     try:
-        # First call succeeds and caches a real contradiction.
         async with async_session_factory() as db:
             found_1, stage_1 = await cx.detect_contradictions(
                 db, working_llm, [chunk_a, chunk_b], "q1", sim_min=0.5, sim_max=0.97, max_pairs=8, min_confidence=0.5
@@ -298,20 +276,17 @@ async def test_llm_failure_still_returns_previously_cached_contradictions():
         assert len(found_1) == 1
         assert stage_1.error is None
 
-        # Second call: the LLM is down, but this pair was already cached
-        # last time — cache lookup happens BEFORE the LLM call, so it
-        # should still be returned even though today's call would fail.
         dying_llm = _RateLimitedStructuredLLM(rate_limited=False)
         async with async_session_factory() as db:
             found_2, stage_2 = await cx.detect_contradictions(
                 db, dying_llm, [chunk_a, chunk_b], "q2", sim_min=0.5, sim_max=0.97, max_pairs=8, min_confidence=0.5
             )
 
-        assert len(found_2) == 1  # the cached one, unaffected by today's outage
+        assert len(found_2) == 1
         assert found_2[0].id == found_1[0].id
-        assert stage_2.llm_calls == 0  # fully cached, no LLM call needed at all
+        assert stage_2.llm_calls == 0
         assert stage_2.error is None
-        assert dying_llm.calls == []  # never even attempted
+        assert dying_llm.calls == []
     finally:
         await _cleanup_document(chunk_a.document_id)
         await _cleanup_document(chunk_b.document_id)

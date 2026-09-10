@@ -25,10 +25,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.adapters.extraction import Block
 
-# The 1800-char ceiling is not arbitrary: it derives from the embedding
-# model's 512-token limit. Text longer than the model's context window is
-# silently truncated at embed time, so anything past the ceiling would be
-# indexed under a vector that never saw it — dead weight in the chunk table.
 _RECURSIVE_SEPARATORS = ["\n\n", "\n", ". ", "! ", "? ", "; ", " "]
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
 
@@ -62,9 +58,6 @@ def chunk_blocks(
     min_chars: int,
     overlap_chars: int,
 ) -> Iterator[ChunkDraft]:
-    # Segment grouping needs the whole document's blocks in hand (a segment
-    # can't be decided one block at a time), but this is just extracted
-    # text — far smaller than the source PDF/DOCX it came from.
     block_list = list(blocks)
 
     expanded: list[Block] = []
@@ -123,10 +116,6 @@ def _merge_undersized_segments(segments: list[_Segment], min_chars: int) -> list
     i = 0
     while i < len(segments):
         current = segments[i]
-        # A run of consecutive tiny segments (e.g. a lone heading with no
-        # body before the next one) can collapse all the way forward, not
-        # just one step, as long as each hop stays on the same page under
-        # the same parent heading.
         while (
             _segment_text_length(current) < min_chars
             and i + 1 < len(segments)
@@ -136,8 +125,6 @@ def _merge_undersized_segments(segments: list[_Segment], min_chars: int) -> list
             nxt = segments[i + 1]
             current = _Segment(
                 page=current.page,
-                # The merged content now reads as belonging to the section
-                # it merged into, not the tiny one it came from.
                 section_path=nxt.section_path,
                 blocks=current.blocks + nxt.blocks,
             )
@@ -150,7 +137,7 @@ def _merge_undersized_segments(segments: list[_Segment], min_chars: int) -> list
 def _pack_segment(block_texts: list[str], target_chars: int, max_chars: int, overlap_chars: int) -> list[str]:
     chunks: list[str] = []
     buffer = ""
-    buffer_is_seed = False  # buffer holds only a carried-over overlap tail, not yet real content
+    buffer_is_seed = False
     idx = 0
     while idx < len(block_texts):
         block_text = block_texts[idx]
@@ -164,15 +151,10 @@ def _pack_segment(block_texts: list[str], target_chars: int, max_chars: int, ove
                 buffer = _overlap_seed(buffer, overlap_chars)
                 buffer_is_seed = bool(buffer)
         elif buffer and not buffer_is_seed:
-            # Buffer already holds a real chunk's worth of content; close it
-            # and retry this block against a fresh, overlap-seeded buffer.
             chunks.append(buffer)
             buffer = _overlap_seed(buffer, overlap_chars)
             buffer_is_seed = bool(buffer)
         else:
-            # buffer is empty, or is a seed that doesn't even fit combined
-            # with the next block (a large fragment following it) — drop
-            # the seed rather than emit an overlap-only stub chunk.
             buffer = block_text
             buffer_is_seed = False
             idx += 1

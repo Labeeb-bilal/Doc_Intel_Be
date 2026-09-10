@@ -27,8 +27,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
 
-# Valid values, enforced in the service layer (not DB-level enums) so new
-# statuses/codes don't require a migration during active development.
 DOCUMENT_STATUSES = ("pending", "processing", "ready", "failed")
 FILE_TYPES = ("pdf", "docx", "md", "txt")
 ERROR_CODES = (
@@ -79,7 +77,6 @@ class Chunk(Base):
     __tablename__ = "chunks"
     __table_args__ = (UniqueConstraint("document_id", "ordinal", name="uq_chunks_document_ordinal"),)
 
-    # Identical to the Qdrant point ID (deterministic uuid5, see adapters/vectors.py).
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     document_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
@@ -93,16 +90,11 @@ class Chunk(Base):
     document: Mapped[Document] = relationship(back_populates="chunks")
 
 
-# ---------------------------------------------------------------------------
-# Phase two: retrieval + RAG + chat
-# ---------------------------------------------------------------------------
-
-
 class Conversation(Base):
     __tablename__ = "conversations"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    title: Mapped[str | None] = mapped_column(Text, nullable=True)  # first query, truncated to 80 chars
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -121,25 +113,14 @@ class Message(Base):
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
     )
-    role: Mapped[str] = mapped_column(String(10), nullable=False)  # user | assistant
+    role: Mapped[str] = mapped_column(String(10), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    # JSONB deliberately: write-once, read-whole, never queried by internal
-    # field, and the shape will keep changing as the trace iterates.
-    # Normalising these into tables would create joins that never earn
-    # their keep. null for user messages.
     citations: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     trace: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    # IDs of contradictions surfaced by this turn, so a past chat turn can
-    # re-render the conflicts it found without re-running detection.
     contradiction_ids: Mapped[list[uuid.UUID] | None] = mapped_column(ARRAY(UUID(as_uuid=True)), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
-
-
-# ---------------------------------------------------------------------------
-# Phase three: contradiction detection
-# ---------------------------------------------------------------------------
 
 
 class Contradiction(Base):
@@ -164,9 +145,6 @@ class Contradiction(Base):
     document_b_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
     )
-    # Denormalised from chunk text, deliberately: `chunks` has no text
-    # column, and this record must preserve exactly what the user was
-    # shown even if chunking changes later (re-ingestion, a parser fix).
     statement_a: Mapped[str] = mapped_column(Text, nullable=False)
     statement_b: Mapped[str] = mapped_column(Text, nullable=False)
     type: Mapped[str] = mapped_column(String(20), nullable=False)

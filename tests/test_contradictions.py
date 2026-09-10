@@ -27,9 +27,6 @@ def _chunk(chunk_id: str, document_id: str, text: str = "Some statement.") -> Sc
     )
 
 
-# --- Test #4: fingerprint stability -----------------------------------------
-
-
 def test_fingerprint_is_order_independent():
     fp_ab = cx.fingerprint("chunk-a", "chunk-b")
     fp_ba = cx.fingerprint("chunk-b", "chunk-a")
@@ -40,13 +37,10 @@ def test_fingerprint_differs_for_different_pairs():
     assert cx.fingerprint("c1", "c2") != cx.fingerprint("c1", "c3")
 
 
-# --- Test #1: same-document filter ------------------------------------------
-
-
 def test_same_document_pairs_are_always_excluded():
     chunks = [
         _chunk("c1", "doc-1"),
-        _chunk("c2", "doc-1"),  # same document as c1
+        _chunk("c2", "doc-1"),
         _chunk("c3", "doc-2"),
     ]
 
@@ -55,7 +49,6 @@ def test_same_document_pairs_are_always_excluded():
     pair_ids = {(a.chunk_id, b.chunk_id) for a, b in pairs}
     assert ("c1", "c2") not in pair_ids
     assert ("c2", "c1") not in pair_ids
-    # cross-document pairs survive
     assert ("c1", "c3") in pair_ids
     assert ("c2", "c3") in pair_ids
 
@@ -69,9 +62,6 @@ def test_form_pairs_with_no_chunks_or_one_chunk_produces_nothing():
     assert cx.form_pairs([_chunk("c1", "doc-1")]) == ([], [])
 
 
-# --- Test #2: cosine bounds -------------------------------------------------
-
-
 def _unit_vector(angle_from_reference_deg: float, dim: int = 8) -> list[float]:
     """Builds a vector whose cosine similarity to the all-ones reference
     vector is cos(angle). Lets tests target an exact, known cosine value
@@ -79,8 +69,6 @@ def _unit_vector(angle_from_reference_deg: float, dim: int = 8) -> list[float]:
     import math
 
     ref = [1.0] * dim
-    # Simple two-component construction: mix `ref` with an orthogonal
-    # vector by cos/sin of the target angle.
     orth = [1.0, -1.0] + [0.0] * (dim - 2)
     rad = math.radians(angle_from_reference_deg)
     ref_norm = math.sqrt(dim)
@@ -97,13 +85,13 @@ def test_cosine_similarity_of_identical_vectors_is_one():
 
 def test_cosine_similarity_matches_known_angle():
     ref = [1.0] * 8
-    v60 = _unit_vector(60.0)  # cos(60 deg) == 0.5
+    v60 = _unit_vector(60.0)
     assert cx.cosine_similarity(ref, v60) == pytest.approx(0.5, abs=1e-6)
 
 
 def test_pairs_below_lower_bound_are_excluded():
     ref = [1.0] * 8
-    far = _unit_vector(90.0)  # cos(90 deg) == 0.0, well under 0.75
+    far = _unit_vector(90.0)
     a = _chunk("a", "doc-1", "Some claim about topic A.")
     a.vector = ref
     b = _chunk("b", "doc-2", "An unrelated claim about topic B.")
@@ -121,8 +109,8 @@ def test_near_duplicate_pair_is_excluded_above_upper_bound():
     v = [0.1, 0.2, 0.3, 0.4, 0.5]
     a = _chunk("a", "doc-1", "The office is open on weekdays for all staff.")
     a.vector = v
-    b = _chunk("b", "doc-2", "The office is open on weekdays for all staff.")  # identical wording, no numbers
-    b.vector = v  # identical vector -> cosine 1.0, well above 0.97
+    b = _chunk("b", "doc-2", "The office is open on weekdays for all staff.")
+    b.vector = v
 
     kept, log_entries, exemptions = cx.filter_by_cosine([(a, b)], sim_min=0.75, sim_max=0.97, max_pairs=8)
 
@@ -137,7 +125,7 @@ def test_numeric_different_pair_survives_upper_bound_despite_near_duplicate_cosi
     a = _chunk("a", "doc-1", "The service fee is $50 per transaction.")
     a.vector = v
     b = _chunk("b", "doc-2", "The service fee is $75 per transaction.")
-    b.vector = v  # forced identical vector -> cosine 1.0, above 0.97, but numbers differ
+    b.vector = v
 
     kept, log_entries, exemptions = cx.filter_by_cosine([(a, b)], sim_min=0.75, sim_max=0.97, max_pairs=8)
 
@@ -149,12 +137,6 @@ def test_numeric_different_pair_survives_upper_bound_despite_near_duplicate_cosi
 
 
 def test_numeric_tokens_extraction():
-    # Note on the spec's own regex (`\b\d+(?:\.\d+)?%?\b`): the trailing
-    # `%` only survives when immediately followed by a word character with
-    # no boundary in between — in real prose "%" is always followed by
-    # whitespace or punctuation, so in practice it never keeps the "%" and
-    # extracts the bare number. That's a property of the given regex, not
-    # a defect in this implementation of it.
     assert cx.numeric_tokens("The fee is $50 per transaction, up 12.5%.") == {"50", "12.5"}
     assert cx.numeric_tokens("No numbers here at all") == set()
     assert cx.numeric_tokens("$50 per transaction") != cx.numeric_tokens("$75 per transaction")
@@ -165,7 +147,7 @@ def test_pair_cap_keeps_highest_cosine_and_logs_the_rest_as_over_limit():
     for i in range(10):
         a = _chunk(f"a{i}", f"doc-a{i}", "claim")
         b = _chunk(f"b{i}", f"doc-b{i}", "counter-claim")
-        angle = 10.0 + i  # increasing angle -> decreasing cosine
+        angle = 10.0 + i
         a.vector = [1.0] * 8
         b.vector = _unit_vector(angle)
         pairs.append((a, b))
@@ -175,12 +157,8 @@ def test_pair_cap_keeps_highest_cosine_and_logs_the_rest_as_over_limit():
     assert len(kept) == 3
     over_limit = [e for e in log_entries if e.reason == "over_pair_limit"]
     assert len(over_limit) == 7
-    # the 3 kept must be the 3 highest-cosine (lowest-angle) pairs
     kept_ids = {a.chunk_id for a, b in kept}
     assert kept_ids == {"a0", "a1", "a2"}
-
-
-# --- Test #3: span verification ---------------------------------------------
 
 
 def _verdict(**overrides) -> "ContradictionVerdict":
@@ -212,7 +190,6 @@ def test_verbatim_spans_pass_verification():
 def test_fabricated_quote_is_rejected():
     a = _chunk("a", "doc-1", "Details here. The fee is $50. More details follow.")
     b = _chunk("b", "doc-2", "Other text. The fee is $75. End of section.")
-    # statement_a does not appear anywhere in chunk a's text — hallucinated
     verdict = _verdict(statement_a="The fee is actually $999, a totally different number.")
 
     assert cx.spans_present(verdict, a, b) is False
@@ -260,24 +237,17 @@ def test_span_check_still_rejects_genuinely_different_content_despite_no_space_f
     assert cx.spans_present(verdict, a, b) is False
 
 
-# --- Grouping / deduplication -----------------------------------------------
-
-
 def _fake_contradiction(id_, chunk_a_id, chunk_b_id, type_="numerical"):
     return SimpleNamespace(id=id_, chunk_a_id=chunk_a_id, chunk_b_id=chunk_b_id, type=type_)
 
 
 def test_star_topology_from_shared_chunk_merges_into_one_group():
-    # The exact real-world shape this was built for: one "2 days" chunk
-    # compared pairwise against three different "3 days" chunks in three
-    # different documents produces 3 distinct, individually-correct pairs
-    # — all evidence for the same underlying disagreement.
     shared = uuid.uuid4()
     a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     records = [
         _fake_contradiction(uuid.uuid4(), shared, a),
         _fake_contradiction(uuid.uuid4(), shared, b),
-        _fake_contradiction(uuid.uuid4(), c, shared),  # shared can be on either side
+        _fake_contradiction(uuid.uuid4(), c, shared),
     ]
 
     groups = cx.group_contradictions(records)
@@ -287,8 +257,6 @@ def test_star_topology_from_shared_chunk_merges_into_one_group():
 
 
 def test_different_type_does_not_merge_even_with_shared_chunk():
-    # A multi-topic chunk (real risk after neighbour expansion) must not
-    # bridge two unrelated conflicts into one group.
     shared = uuid.uuid4()
     records = [
         _fake_contradiction(uuid.uuid4(), shared, uuid.uuid4(), type_="numerical"),
@@ -313,8 +281,6 @@ def test_disjoint_pairs_stay_in_separate_groups():
 
 
 def test_transitive_chain_merges_across_multiple_hops():
-    # A-B and B-C share chunk B -> one group, even though A and C never
-    # appear in the same pairwise record together.
     a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     records = [
         _fake_contradiction(uuid.uuid4(), a, b),
@@ -336,9 +302,6 @@ def test_single_record_is_its_own_group():
     groups = cx.group_contradictions(records)
     assert len(groups) == 1
     assert len(groups[0]) == 1
-
-
-# --- Response trimming: evidence items don't repeat the group headline -----
 
 
 def test_evidence_item_omits_fields_already_shown_at_group_level():

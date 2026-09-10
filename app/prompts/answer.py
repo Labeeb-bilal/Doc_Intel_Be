@@ -43,7 +43,7 @@ def build_user_prompt(*, history: list[HistoryMessage], context: str, query: str
     for msg in history:
         lines.append(f"Previous question: {msg.content}")
     if lines:
-        lines.append("")  # blank line separator before current question
+        lines.append("")
     lines.append(f"Current question: {query}")
     lines.append("")
     lines.append("Sources:")

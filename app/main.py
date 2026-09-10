@@ -23,15 +23,12 @@ log = structlog.get_logger("startup")
 async def lifespan(app: FastAPI):
     settings = get_settings()
 
-    # Schema creation only — no Alembic. See README for the production gap.
     await init_db()
     log.info("db_schema_ready")
 
     await vectors.ensure_collection(settings.qdrant_collection)
     log.info("qdrant_collection_ready", collection=settings.qdrant_collection)
 
-    # Loaded once here, not per request. fastembed is synchronous/CPU-bound,
-    # so run it off the event loop even though this only happens once.
     await asyncio.to_thread(embeddings.load_model)
     app.state.embedding_model_loaded = True
     app.state.embedding_model_name = settings.embedding_model

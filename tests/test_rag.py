@@ -53,24 +53,21 @@ def test_build_user_prompt_no_history():
 
 
 async def test_hallucinated_citation_is_dropped_and_counted():
-    chunks = [_make_chunk(f"c{i}") for i in range(1, 7)]  # six real sources, S1..S6
+    chunks = [_make_chunk(f"c{i}") for i in range(1, 7)]
     result = _make_result(chunks)
     llm = FakeLLMClient(response="The policy allows this. [S2] It also says that. [S7]")
 
     outcome = await rag.answer(llm, result)
 
     assert "[S2]" in outcome["answer"]
-    assert "[S7]" not in outcome["answer"]  # hallucinated marker must not render
+    assert "[S7]" not in outcome["answer"]
     assert len(outcome["citations"]) == 1
     assert outcome["citations"][0].marker == "S2"
     assert result.trace.answer.citations_dropped == 1
 
 
 async def test_grouped_citation_validates_each_marker_independently():
-    # Real models group citations like "[S1, S2, S9]" rather than always
-    # emitting one bracket per marker — the parser must validate each
-    # marker in the group on its own, not treat the whole group as one unit.
-    chunks = [_make_chunk("c1"), _make_chunk("c2"), _make_chunk("c3")]  # S1, S2, S3
+    chunks = [_make_chunk("c1"), _make_chunk("c2"), _make_chunk("c3")]
     result = _make_result(chunks)
     llm = FakeLLMClient(response="Employees may do this. [S1, S2, S9]")
 
@@ -83,7 +80,7 @@ async def test_grouped_citation_validates_each_marker_independently():
 
 
 async def test_grouped_citation_dropped_entirely_when_all_markers_invalid():
-    chunks = [_make_chunk("c1")]  # only S1 exists
+    chunks = [_make_chunk("c1")]
     result = _make_result(chunks)
     llm = FakeLLMClient(response="A claim. [S5, S9]")
 
@@ -96,13 +93,13 @@ async def test_grouped_citation_dropped_entirely_when_all_markers_invalid():
 
 
 async def test_relevance_floor_skips_llm_and_is_not_grounded():
-    result = _make_result([])  # nothing cleared the floor
+    result = _make_result([])
 
     llm = FakeLLMClient(response="should never be seen")
 
     outcome = await rag.answer(llm, result)
 
-    assert llm.calls == []  # the LLM must never be called
+    assert llm.calls == []
     assert outcome["grounded"] is False
     assert outcome["citations"] == []
     assert outcome["answer"] == rag.NOT_FOUND_ANSWER
@@ -122,7 +119,7 @@ async def test_answer_with_no_citations_at_all_is_not_grounded():
 async def test_context_truncates_when_budget_exceeded(monkeypatch):
     from app.config import get_settings
 
-    long_text = "word " * 2000  # comfortably over a tiny budget
+    long_text = "word " * 2000
     chunks = [_make_chunk("c1", long_text), _make_chunk("c2", long_text)]
     result = _make_result(chunks)
     llm = FakeLLMClient(response="ok [S1]")

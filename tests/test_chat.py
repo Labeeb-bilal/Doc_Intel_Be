@@ -21,11 +21,6 @@ from tests.fakes import FakeLLMClient
 
 
 def test_chat_request_rejects_assistant_history():
-    # No TestClient/`client` fixture exists in this suite (every test here
-    # calls services directly against live infra) — this is the equivalent
-    # unit-level check for what FastAPI's 422 translation actually rests
-    # on: role: Literal["user"] on HistoryMessage rejects anything else at
-    # the schema boundary, before any service code runs.
     with pytest.raises(ValidationError):
         ChatRequest(query="follow up", history=[{"role": "assistant", "content": "previous answer"}])
 
@@ -37,16 +32,12 @@ def test_chat_request_rejects_history_over_limit():
             history=[
                 {"role": "user", "content": "q1"},
                 {"role": "user", "content": "q2"},
-                {"role": "user", "content": "q3"},  # over the max_length=2 cap
+                {"role": "user", "content": "q3"},
             ],
         )
 
 
 async def test_chat_works_with_no_history_field():
-    # send_message's `history` parameter defaults to None -> [] and every
-    # call site below this omits it entirely, the same way every pre-existing
-    # test in this file already does — this just names that guarantee
-    # explicitly: omitting `history` is not a degraded path.
     llm = FakeLLMClient(response="Employees may work remotely. [S1]")
 
     async with async_session_factory() as db:
@@ -122,7 +113,7 @@ async def test_chat_creates_conversation_and_persists_both_messages():
     assert messages[0].role == "user"
     assert messages[0].content == "How many days per week can employees work remotely?"
     assert messages[1].role == "assistant"
-    assert messages[1].trace is not None  # full trace persisted, re-renderable later
+    assert messages[1].trace is not None
     assert messages[1].citations is not None
 
     async with async_session_factory() as db:
@@ -159,15 +150,12 @@ async def test_llm_failure_rolls_back_and_persists_nothing():
     async with async_session_factory() as db:
         after = len((await db.execute(select(Conversation.id))).all())
 
-    assert after == before  # no orphan conversation left behind
+    assert after == before
 
 
 async def test_rate_limited_llm_failure_returns_429_with_retry_after():
     class _RateLimitedLLM:
         async def complete(self, *, system: str, user: str) -> str:
-            # rate_limited=True is what GroqClient sets when the
-            # underlying failure was specifically a 429 after retries
-            # were exhausted — this is the flag chat.py branches on.
             raise LLMUnavailableError("rate limited upstream", rate_limited=True)
 
         async def complete_structured(self, *, system, user, schema):
@@ -192,7 +180,7 @@ async def test_rate_limited_llm_failure_returns_429_with_retry_after():
     async with async_session_factory() as db:
         after = len((await db.execute(select(Conversation.id))).all())
 
-    assert after == before  # no orphan conversation left behind here either
+    assert after == before
 
 
 async def test_chat_response_trace_is_trimmed_of_debug_detail():
@@ -249,7 +237,7 @@ async def test_get_message_trace_returns_full_untrimmed_detail():
         full_trace = await chat_service.get_message_trace(db, conv_id, msg_id)
 
     assert isinstance(full_trace, RetrievalTrace)
-    assert full_trace.retrieval.candidates  # the part the trimmed response drops
+    assert full_trace.retrieval.candidates
     assert full_trace.trace_id == result["trace"].trace_id
 
     async with async_session_factory() as db:

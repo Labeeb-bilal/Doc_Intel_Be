@@ -45,11 +45,8 @@ from app.models import Chunk, Document
 
 log = structlog.get_logger("ingestion")
 
-# ---------------------------------------------------------------------------
-# Upload
-# ---------------------------------------------------------------------------
 
-_READ_CHUNK_BYTES = 1024 * 1024  # 1MB, per spec
+_READ_CHUNK_BYTES = 1024 * 1024
 _EXTENSION_TYPES = {".pdf": "pdf", ".docx": "docx", ".md": "md", ".txt": "txt"}
 
 
@@ -76,18 +73,16 @@ def _mime_matches(expected_type: str, mime: str) -> bool:
     if expected_type == "pdf":
         return mime == "application/pdf"
     if expected_type == "docx":
-        # Some libmagic databases can't see past the OOXML zip container.
         return mime in {
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "application/zip",
         }
-    # md / txt: plain text has no distinct magic signature beyond "text/*".
     return mime.startswith("text/")
 
 
 async def _read_in_chunks(file: UploadFile, size: int) -> AsyncIterator[bytes]:
     while True:
-        chunk = await file.read(size)  # never call .read() with no argument
+        chunk = await file.read(size)
         if not chunk:
             break
         yield chunk
@@ -116,8 +111,6 @@ async def _stream_validate_and_hash(
                     details={"detected_mime": mime, "expected_type": expected_type},
                 )
         result.size += len(chunk)
-        # Inside the loop so an oversized upload aborts after the first
-        # megabyte rather than after the whole file has landed.
         if result.size > max_bytes:
             await storage.delete(key)
             raise AppError(
@@ -176,9 +169,6 @@ async def upload_documents(
 
             existing = await db.scalar(select(Document).where(Document.content_hash == content_hash))
             if existing is not None:
-                # Redundant copy of content we already have (or already have
-                # in flight) — drop it, and never create a second row: the
-                # UNIQUE constraint on content_hash would reject it anyway.
                 await storage.delete(key)
                 created_keys.remove(key)
                 results.append(
@@ -201,7 +191,7 @@ async def upload_documents(
                 status="pending",
             )
             db.add(document)
-            await db.flush()  # populate document.id without committing yet
+            await db.flush()
             created_doc_ids.append(document.id)
             results.append(
                 {
@@ -227,11 +217,6 @@ async def upload_documents(
     return results
 
 
-# ---------------------------------------------------------------------------
-# Read / delete
-# ---------------------------------------------------------------------------
-
-
 async def list_documents(db: AsyncSession, status: str | None = None) -> list[Document]:
     stmt = select(Document).order_by(Document.created_at.desc())
     if status:
@@ -250,7 +235,7 @@ async def get_document(db: AsyncSession, document_id: uuid.UUID) -> Document:
 async def get_document_chunks(
     db: AsyncSession, document_id: uuid.UUID, limit: int, offset: int
 ) -> tuple[list[dict], int]:
-    await get_document(db, document_id)  # 404 if missing
+    await get_document(db, document_id)
     settings = get_settings()
 
     total = await db.scalar(select(func.count()).select_from(Chunk).where(Chunk.document_id == document_id))
@@ -285,9 +270,6 @@ async def delete_document(db: AsyncSession, document_id: uuid.UUID) -> None:
     settings = get_settings()
     storage = get_storage_backend()
 
-    # Qdrant first, deliberately: a mid-way failure then leaves an orphaned
-    # file (harmless) rather than orphaned vectors, which would produce
-    # citations pointing at a document that no longer exists.
     await vectors_adapter.delete_by_document_id(settings.qdrant_collection, document_id)
     await db.execute(delete(Chunk).where(Chunk.document_id == document_id))
     await storage.delete(document.storage_key)
@@ -329,13 +311,6 @@ async def get_stats() -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Background pipeline
-# ---------------------------------------------------------------------------
-
-# Documents are processed one at a time: parallel CPU-bound embedding would
-# contend for the same cores and gain nothing, while making failures harder
-# to reason about.
 _PROCESSING_SEMAPHORE = asyncio.Semaphore(1)
 
 _EMBED_BATCH_SIZE = 32
@@ -499,9 +474,6 @@ async def process_document(document_id: uuid.UUID) -> None:
             )
 
             try:
-                # Clean slate first: wipe any leftovers from a previous
-                # attempt so this run is idempotent whether it's a fresh
-                # attempt, a /retry, or a manual re-run.
                 await vectors_adapter.delete_by_document_id(settings.qdrant_collection, document_id)
                 await db.execute(delete(Chunk).where(Chunk.document_id == document_id))
                 await db.commit()
@@ -516,13 +488,10 @@ async def process_document(document_id: uuid.UUID) -> None:
                     raise ExtractionError(f"Extraction for '{document.file_type}' files is not supported.")
 
                 extraction_metadata: dict = {}
-                # ExtractionError subclasses propagate untouched: deterministic, no retry.
                 blocks = list(extractor(data, metadata=extraction_metadata))
 
                 page_values = [b.page for b in blocks if b.page is not None]
                 page_count = max(page_values) if page_values else None
-                # Markdown frontmatter, when present, is more authoritative
-                # than the generic regex scan of body text.
                 effective_date = extraction_metadata.get("effective_date") or _extract_effective_date(blocks)
 
                 chunk_drafts = list(
@@ -600,10 +569,6 @@ async def process_document(document_id: uuid.UUID) -> None:
                     document.chunks_done += len(points_buffer)
                     await db.commit()
 
-                # Ordering matters: all vectors are durable in Qdrant before
-                # any chunk row exists, and chunk rows exist before status
-                # flips to ready. A document is never ready with a partial
-                # index.
                 for draft in chunk_drafts:
                     chunk_id = vectors_adapter.compute_chunk_id(document_id, draft.ordinal)
                     db.add(
@@ -645,9 +610,6 @@ async def process_document(document_id: uuid.UUID) -> None:
                     duration_s=round(time.perf_counter() - start, 2),
                 )
 
-                # Partial-failure cleanup: never leave a document ready with
-                # a partial index, and never leave orphaned vectors/rows for
-                # a retry to trip over.
                 with suppress(Exception):
                     await vectors_adapter.delete_by_document_id(settings.qdrant_collection, document_id)
                 with suppress(Exception):
@@ -661,10 +623,6 @@ async def process_document(document_id: uuid.UUID) -> None:
                     failed_document.error_message = message
                     await db.commit()
 
-
-# ---------------------------------------------------------------------------
-# Startup reconciler
-# ---------------------------------------------------------------------------
 
 _INTERRUPTED_AFTER = timedelta(minutes=5)
 

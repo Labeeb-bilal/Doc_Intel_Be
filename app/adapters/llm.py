@@ -124,9 +124,6 @@ class GroqClient:
             "model": self._model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             **_NO_REASONING_PARAMS,
-            # Native constrained decoding, not prompt-and-parse: Groq's
-            # OpenAI-compatible json_schema mode guarantees syntactically
-            # valid JSON matching this schema.
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {"name": schema.__name__, "schema": schema.model_json_schema()},
@@ -203,11 +200,6 @@ class GroqClient:
         return result
 
 
-# No reasoning tokens, ever: explainability here comes from measured
-# pipeline telemetry (scores, ranks, timings), not model narration.
-# reasoning_format=hidden drops any reasoning text from the response
-# entirely (not just from what we read); reasoning_effort=low additionally
-# cuts the tokens actually spent generating it.
 _NO_REASONING_PARAMS = {"reasoning_effort": "low", "reasoning_format": "hidden"}
 
 

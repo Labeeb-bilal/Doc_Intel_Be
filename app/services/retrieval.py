@@ -120,8 +120,6 @@ async def retrieve(
     trace_id = str(uuid.uuid4())
     query_used, condensed = _condense_query(query, previous_user_message)
 
-    # embed_query(), never embed_documents() — BGE is asymmetric and the
-    # query needs the prefix a passage must not have.
     query_vector = await embeddings_adapter.embed_query(query_used)
 
     doc_uuids = [uuid.UUID(d) for d in document_ids] if document_ids else None
@@ -132,8 +130,7 @@ async def retrieve(
         query_vector=query_vector,
         limit=top_k,
         document_ids=doc_uuids,
-        with_vectors=True,  # the next phase needs chunk-to-chunk cosine for
-        # contradiction pairing; re-embedding a chunk you already had is waste.
+        with_vectors=True,
     )
     retrieval_latency_ms = round((time.perf_counter() - retrieval_start) * 1000)
 
@@ -167,18 +164,11 @@ async def retrieve(
             for chunk, logit in zip(candidates, logits):
                 chunk.rerank_score = reranker_adapter.sigmoid(logit)
 
-            # Rerank before neighbour expansion, never after: cross-encoders
-            # cap at ~512 tokens for the (query, chunk) pair. An already
-            # neighbour-expanded chunk would silently get truncated and
-            # scored as a fragment instead of the real chunk.
             ranked = sorted(candidates, key=lambda c: c.rerank_score, reverse=True)
             for rank_after, chunk in enumerate(ranked):
                 chunk.rank_after = rank_after
             rerank_latency_ms = round((time.perf_counter() - rerank_start) * 1000)
 
-            # Floor after reranking, not before: cosine drift with query
-            # phrasing makes a pre-rerank cutoff meaningless. This floor
-            # applies to the sigmoid-normalised rerank score.
             floor = settings.relevance_floor
             kept = [c for c in ranked if c.rerank_score >= floor]
             kept_ids = {c.chunk_id for c in kept[: settings.keep_n]}
@@ -204,8 +194,6 @@ async def retrieve(
             )
             ranked = kept
         except Exception as exc:
-            # Degradation ladder, step 1: reranker fails -> fall back to
-            # vector ordering, note it in the trace, keep going.
             log.warning("rerank_failed", error=str(exc))
             rerank_stage = RerankStage(enabled=False, kept=0, latency_ms=0, error=str(exc))
             ranked = _apply_cosine_floor(candidates, settings.relevance_floor)
@@ -218,7 +206,6 @@ async def retrieve(
         try:
             selected = await _expand_neighbours(selected, settings.qdrant_collection)
         except Exception as exc:
-            # Degradation ladder, step 2: use the chunks unexpanded, continue.
             log.warning("neighbour_expansion_failed", error=str(exc))
 
     trace = RetrievalTrace(

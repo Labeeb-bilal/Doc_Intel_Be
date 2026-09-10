@@ -23,9 +23,6 @@ def _block(text: str, page: int | None, section_path: list[str], ordinal: int) -
     return Block(text=text, page=page, section_path=section_path, ordinal=ordinal)
 
 
-# --- chunk_blocks: end-to-end on handwritten blocks -------------------------
-
-
 def test_no_chunk_spans_a_page_or_section_boundary():
     blocks = [
         _block("Eligibility applies to all full-time staff hired after January 2020.", 1, ["Eligibility"], 0),
@@ -43,8 +40,6 @@ def test_no_chunk_spans_a_page_or_section_boundary():
 
 
 def test_same_section_different_pages_never_collapse_into_one_chunk():
-    # Same section heading recurring on two different pages must stay two
-    # segments — grouping is (page, section_path), not section_path alone.
     blocks = [
         _block("Short eligibility note on page one only.", 1, ["Eligibility"], 0),
         _block("Short eligibility note continued on page two only.", 2, ["Eligibility"], 1),
@@ -74,7 +69,7 @@ def test_oversized_block_splits_and_every_fragment_inherits_page_and_section():
 
 def test_undersized_segment_merges_forward_same_page_same_parent():
     blocks = [
-        _block("Overview.", 1, ["Eligibility", "Overview"], 0),  # tiny -> under min
+        _block("Overview.", 1, ["Eligibility", "Overview"], 0),
         _block(
             "Employees who have completed their probation period are eligible for the hybrid schedule.",
             1,
@@ -85,7 +80,6 @@ def test_undersized_segment_merges_forward_same_page_same_parent():
 
     chunks = list(chunk_blocks(blocks, target_chars=1400, max_chars=1800, min_chars=50, overlap_chars=20))
 
-    # merged into one chunk, taking on the section it merged into
     assert len(chunks) == 1
     assert chunks[0].section_path == ["Eligibility", "Hybrid schedule"]
     assert "Overview." in chunks[0].text
@@ -94,7 +88,7 @@ def test_undersized_segment_merges_forward_same_page_same_parent():
 
 def test_undersized_segment_does_not_merge_across_different_parent():
     blocks = [
-        _block("Overview.", 1, ["Eligibility", "Overview"], 0),  # tiny -> under min
+        _block("Overview.", 1, ["Eligibility", "Overview"], 0),
         _block(
             "Termination requires two weeks written notice from either party involved in the agreement.",
             1,
@@ -105,8 +99,6 @@ def test_undersized_segment_does_not_merge_across_different_parent():
 
     chunks = list(chunk_blocks(blocks, target_chars=1400, max_chars=1800, min_chars=50, overlap_chars=20))
 
-    # different parent heading (Eligibility vs Termination) -> no merge,
-    # even though both are on the same page
     assert len(chunks) == 2
     assert chunks[0].section_path == ["Eligibility", "Overview"]
     assert chunks[1].section_path == ["Termination", "Notice"]
@@ -114,7 +106,7 @@ def test_undersized_segment_does_not_merge_across_different_parent():
 
 def test_undersized_segment_does_not_merge_across_different_page():
     blocks = [
-        _block("Overview.", 1, ["Eligibility", "Overview"], 0),  # tiny -> under min
+        _block("Overview.", 1, ["Eligibility", "Overview"], 0),
         _block(
             "Employees who have completed their probation period are eligible for the hybrid schedule.",
             2,
@@ -130,12 +122,9 @@ def test_undersized_segment_does_not_merge_across_different_page():
     assert chunks[1].page_start == 2
 
 
-# --- internal helpers, tested directly for precision ------------------------
-
-
 def test_pack_segment_respects_target_and_max():
-    sentence = "This is a sentence about eligibility rules today. "  # 51 chars
-    blocks = [sentence] * 10  # 510 chars total
+    sentence = "This is a sentence about eligibility rules today. "
+    blocks = [sentence] * 10
 
     packed = _pack_segment(blocks, target_chars=150, max_chars=200, overlap_chars=0)
 
@@ -146,13 +135,13 @@ def test_pack_segment_respects_target_and_max():
 
 def test_pack_segment_carries_sentence_snapped_overlap_between_chunks():
     sentence = "This is sentence {}. ".format
-    blocks = [sentence(i) for i in range(12)]  # short sentences, forces multiple packed chunks
+    blocks = [sentence(i) for i in range(12)]
 
     packed = _pack_segment(blocks, target_chars=60, max_chars=90, overlap_chars=25)
 
     assert len(packed) >= 2
     seed = _overlap_seed(packed[0], overlap_chars=25)
-    if seed:  # a sentence boundary was found within the overlap window
+    if seed:
         assert packed[1].startswith(seed)
         assert seed in packed[0]
 

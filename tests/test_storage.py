@@ -20,7 +20,7 @@ async def _chunks(data: bytes, size: int):
 @pytest.mark.asyncio
 async def test_put_then_get_roundtrip(tmp_path):
     storage = LocalStorage(str(tmp_path))
-    payload = b"hello world " * 1000  # multi-chunk when read back in 1MB reads is fine either way
+    payload = b"hello world " * 1000
 
     await storage.put("abc.txt", _chunks(payload, 37))
 
@@ -46,7 +46,7 @@ async def test_delete_removes_object(tmp_path):
 @pytest.mark.asyncio
 async def test_delete_missing_object_is_a_noop(tmp_path):
     storage = LocalStorage(str(tmp_path))
-    await storage.delete("never-existed.bin")  # must not raise
+    await storage.delete("never-existed.bin")
 
 
 def test_path_traversal_key_is_rejected(tmp_path):

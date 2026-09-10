@@ -30,7 +30,6 @@ _VECTOR_DIM = 384
 
 
 async def _fake_embed_documents(texts: list[str]) -> list[list[float]]:
-    # Deterministic and cheap — no fastembed call, no network, no CPU work.
     return [[float((hash(text) + i) % 97) / 97 for i in range(_VECTOR_DIM)] for text in texts]
 
 
@@ -96,7 +95,7 @@ async def test_happy_path_upload_to_ready_and_chunks_queryable():
         chunks, total = await ingestion.get_document_chunks(db, doc.id, limit=50, offset=0)
         assert total == refreshed.chunk_count
         assert len(chunks) == total
-        assert all(c["text"] for c in chunks)  # payload text is queryable, not just stored
+        assert all(c["text"] for c in chunks)
 
     await _cleanup(doc.id)
 
@@ -104,7 +103,7 @@ async def test_happy_path_upload_to_ready_and_chunks_queryable():
 async def test_forced_failure_yields_failed_status_not_a_crash():
     doc = await _create_pending_document(filename="empty.txt", content=b"   \n\n  \n\t\n")
 
-    await ingestion.process_document(doc.id)  # must not raise
+    await ingestion.process_document(doc.id)
 
     async with async_session_factory() as db:
         refreshed = await db.get(Document, doc.id)
@@ -149,8 +148,6 @@ async def test_idempotent_reingest_same_chunk_ids_no_duplicate_points():
         first_ids = [row.id for row in rows_1]
     points_after_first = await vectors_adapter.count_points_for_document(settings.qdrant_collection, doc.id)
 
-    # Re-run the whole pipeline on the same document — simulates a manual
-    # re-run or a /retry after a transient failure.
     await ingestion.process_document(doc.id)
 
     async with async_session_factory() as db:
@@ -164,8 +161,8 @@ async def test_idempotent_reingest_same_chunk_ids_no_duplicate_points():
     points_after_second = await vectors_adapter.count_points_for_document(settings.qdrant_collection, doc.id)
 
     assert refreshed.status == "ready"
-    assert first_ids == second_ids  # deterministic uuid5(document_id, ordinal)
-    assert points_after_first == points_after_second  # upsert overwrote, did not duplicate
+    assert first_ids == second_ids
+    assert points_after_first == points_after_second
     assert points_after_second == len(second_ids)
 
     await _cleanup(doc.id)

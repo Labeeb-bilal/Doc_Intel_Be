@@ -17,20 +17,17 @@ from app.adapters.extraction import (
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-# --- PDF ---------------------------------------------------------------
-
-
 def test_pdf_fixture_has_correct_pages_and_strips_running_header_footer():
     data = (FIXTURES / "sample.pdf").read_bytes()
     blocks = list(extract_pdf(data))
 
     assert [b.page for b in blocks] == [1, 2, 3]
     assert [b.ordinal for b in blocks] == [0, 1, 2]
-    assert all(b.section_path == [] for b in blocks)  # no structural markup in a PDF
+    assert all(b.section_path == [] for b in blocks)
 
     full_text = " ".join(b.text for b in blocks)
-    assert "REMOTE WORK POLICY" not in full_text  # running header stripped
-    assert "Confidential" not in full_text  # running footer stripped
+    assert "REMOTE WORK POLICY" not in full_text
+    assert "Confidential" not in full_text
 
 
 def test_pdf_fixture_rejoins_hyphenated_word_across_line_break():
@@ -43,7 +40,6 @@ def test_pdf_fixture_rejoins_hyphenated_word_across_line_break():
 
 
 def test_pdf_scanned_image_raises_no_text_layer_error():
-    # A single-character page has far fewer than 50 chars/page.
     import subprocess
     import tempfile
 
@@ -60,9 +56,6 @@ def test_pdf_scanned_image_raises_no_text_layer_error():
         list(extract_pdf(data))
 
 
-# --- DOCX ----------------------------------------------------------------
-
-
 def test_docx_fixture_has_correct_section_paths_and_null_pages():
     data = (FIXTURES / "sample.docx").read_bytes()
     blocks = list(extract_docx(data))
@@ -76,14 +69,12 @@ def test_docx_fixture_has_correct_section_paths_and_null_pages():
 
 
 def test_docx_fixture_includes_table_content_in_document_order():
-    # document.paragraphs would silently skip this — must not regress to it.
     data = (FIXTURES / "sample.docx").read_bytes()
     blocks = list(extract_docx(data))
 
     table_blocks = [b for b in blocks if "|" in b.text]
     assert any("Role" in b.text and "Max remote days" in b.text for b in table_blocks)
     assert any("Engineer" in b.text and "3" in b.text for b in table_blocks)
-    # table rows appear under the section they were placed in
     assert all(b.section_path == ["Eligibility", "Hybrid schedule"] for b in table_blocks)
 
 
@@ -92,12 +83,9 @@ def test_docx_empty_document_raises():
     from io import BytesIO
 
     buf = BytesIO()
-    DocxDocument().save(buf)  # a blank, truly empty docx
+    DocxDocument().save(buf)
     with pytest.raises(EmptyDocumentError):
         list(extract_docx(buf.getvalue()))
-
-
-# --- Markdown --------------------------------------------------------------
 
 
 def test_md_fixture_has_correct_section_paths_and_null_pages():
@@ -129,7 +117,6 @@ def test_md_fixture_code_fence_not_split_and_hash_inside_not_a_heading():
     assert len(fence_blocks) == 1
     assert "def is_eligible" in fence_blocks[0].text
     assert "# this hash should NOT be treated as a heading" in fence_blocks[0].text
-    # the in-fence comment must not have become a section heading
     assert "this hash should not be treated as a heading" not in [
         s.lower() for path in [b.section_path for b in blocks] for s in path
     ]

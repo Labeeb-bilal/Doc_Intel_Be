@@ -16,7 +16,7 @@ from typing import Protocol, runtime_checkable
 
 from app.config import Settings, get_settings
 
-_READ_CHUNK = 1024 * 1024  # 1MB, matches the upload streaming chunk size
+_READ_CHUNK = 1024 * 1024
 
 
 @runtime_checkable
@@ -38,7 +38,6 @@ class LocalStorage:
         self._base.mkdir(parents=True, exist_ok=True)
 
     def _path(self, key: str) -> Path:
-        # Keys are server-generated UUIDs, but guard against traversal anyway.
         candidate = Path(key)
         if candidate.is_absolute() or ".." in candidate.parts:
             raise ValueError(f"unsafe storage key: {key!r}")
@@ -80,7 +79,7 @@ class S3Storage:
 
     def __init__(self, *, endpoint: str | None, bucket: str, access_key: str | None,
                  secret_key: str | None, region: str | None):
-        import aioboto3  # imported lazily so LocalStorage users need no S3 creds
+        import aioboto3
 
         self._bucket = bucket
         self._session = aioboto3.Session()
@@ -92,8 +91,6 @@ class S3Storage:
         }
 
     async def put(self, key: str, data: AsyncIterator[bytes]) -> None:
-        # Bounded by MAX_FILE_SIZE_MB, so buffering the object before the PUT
-        # is safe; S3's multipart API needs a seekable/known-length body.
         buf = io.BytesIO()
         async for chunk in data:
             buf.write(chunk)

@@ -70,20 +70,11 @@ async def send_message(
     else:
         conversation = Conversation(title=query[:_TITLE_MAX_LEN])
         db.add(conversation)
-        await db.flush()  # populate conversation.id without committing yet
+        await db.flush()
 
     try:
-        # Resolving the real client here (not in the route) means a
-        # missing/dead API key hits the exact same except block below as a
-        # mid-call failure — one consistent translation to the error
-        # envelope instead of two.
         llm = llm or get_llm_client()
 
-        # Retrieval runs exactly once, on the raw query alone — no
-        # conversational history feeds this. rag.answer() mutates
-        # result.trace in place (context/answer/total_ms) and decides
-        # whether to call the LLM at all; `history` reaches the LLM prompt
-        # through it, not through retrieval.
         result = await retrieve(
             query,
             top_k=top_k,
@@ -99,8 +90,6 @@ async def send_message(
             detect_contradictions=detect_contradictions and settings.contradiction_enabled,
         )
     except LLMUnavailableError as exc:
-        # Never leave a dangling empty conversation row (new-conversation
-        # case) or a half-written turn behind on this failure.
         await db.rollback()
         if exc.rate_limited:
             raise AppError(
@@ -115,20 +104,9 @@ async def send_message(
             status_code=503,
         ) from exc
 
-    # outcome["contradictions"] is already list[ContradictionGroupOut] —
-    # services/rag.py's contradiction branch groups and builds the display
-    # view itself (it already owns `db` for the whole branch). Persist the
-    # id of every individual pairwise record shown, across every group's
-    # evidence, not just one id per group — that's the full evidence trail
-    # this turn surfaced, and what a past turn re-renders from later.
     contradiction_groups = outcome["contradictions"]
     contradiction_ids = [uuid.UUID(ev.id) for group in contradiction_groups for ev in group.evidence]
 
-    # Both rows are inserted in the same transaction, and Postgres's now()
-    # is frozen for the whole transaction — the server_default alone would
-    # give both messages the identical created_at, making their relative
-    # order (which GET /conversations/{id}/messages relies on) undefined.
-    # Set them explicitly, in Python, a beat apart.
     user_created_at = datetime.now(timezone.utc)
     user_message = Message(conversation_id=conversation.id, role="user", content=query, created_at=user_created_at)
     assistant_message = Message(
@@ -142,9 +120,6 @@ async def send_message(
     )
     db.add(user_message)
     db.add(assistant_message)
-    # Both messages are persisted together, only once the turn actually
-    # succeeded — "Persists both the user and assistant messages" means as
-    # a pair, not the user's question alone if generation then fails.
     await db.execute(update(Conversation).where(Conversation.id == conversation.id).values(updated_at=func.now()))
     await db.commit()
     await db.refresh(assistant_message)
@@ -156,11 +131,6 @@ async def send_message(
         "citations": outcome["citations"],
         "contradictions": contradiction_groups,
         "contradictions_total": outcome["contradictions_total"],
-        # The full trace (all retrieval candidates, every rerank result,
-        # the full contradiction filter_log) is persisted below unabridged
-        # — this response only carries the summary a frontend renders.
-        # Fetch the full thing via get_message_trace() /
-        # GET /conversations/{id}/messages/{message_id}/trace when needed.
         "trace": summarize_trace(result.trace),
         "grounded": outcome["grounded"],
     }
@@ -213,7 +183,5 @@ async def get_message_trace(db: AsyncSession, conversation_id: uuid.UUID, messag
             f"Message {message_id} not found in conversation {conversation_id}.", code="MESSAGE_NOT_FOUND"
         )
     if message.trace is None:
-        # User messages (and any assistant turn that somehow predates
-        # tracing) simply have nothing to show here.
         raise NotFoundError(f"Message {message_id} has no trace.", code="TRACE_NOT_FOUND")
     return RetrievalTrace.model_validate(message.trace)

@@ -26,7 +26,6 @@ def test_fixture_produces_three_ordered_blocks():
     assert "first paragraph" in blocks[0].text
     assert "second paragraph" in blocks[1].text
     assert "third paragraph" in blocks[2].text
-    # blank-line splitting must not leak the separator into the block text
     assert "\n\n" not in blocks[0].text
 
 
@@ -47,8 +46,6 @@ def test_whitespace_only_file_raises_empty_document_error():
 
 
 def test_cp1252_encoding_is_detected_and_decoded():
-    # Windows-1252 is common in exported documents; 0x92 is a right single
-    # quote in cp1252 but invalid as UTF-8 continuation byte on its own.
     original = "The employee’s remote schedule is flexible."
     data = original.encode("cp1252")
 
@@ -59,7 +56,6 @@ def test_cp1252_encoding_is_detected_and_decoded():
 
 
 def test_part_anchor_cycles_every_thirty_blocks():
-    # 65 paragraphs -> Part 1 (0-29), Part 2 (30-59), Part 3 (60-64)
     paragraphs = [f"Paragraph number {i} with some body text." for i in range(65)]
     data = ("\n\n".join(paragraphs)).encode("utf-8")
 

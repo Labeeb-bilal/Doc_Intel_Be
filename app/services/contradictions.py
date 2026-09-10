@@ -150,11 +150,6 @@ async def gather_candidate_pairs(
     return uncached_pairs, reusable_cached, log_entries
 
 
-# ---------------------------------------------------------------------------
-# Cosine bounds + numeric exemption
-# ---------------------------------------------------------------------------
-
-
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     """Plain-Python dot-product cosine — no numpy needed for 384-dim
     vectors we already have in memory (with_vectors=True on the retrieval
@@ -205,8 +200,6 @@ def filter_by_cosine(
 
     for a, b in pairs:
         if a.vector is None or b.vector is None:
-            # Defensive: retrieval always requests with_vectors=True, but
-            # never silently drop a pair without explaining why.
             log_entries.append(
                 PairDecision(
                     chunk_a_id=a.chunk_id, chunk_b_id=b.chunk_id, cosine=None, accepted=False, reason="no_vector"
@@ -247,16 +240,11 @@ def filter_by_cosine(
 
         scored.append((cosine, (a, b)))
 
-    # Cap last: keep the pairs most likely to actually be related (highest
-    # cosine) and log the rest as explicitly over the limit, not silently
-    # dropped.
     scored.sort(key=lambda item: item[0], reverse=True)
     kept = scored[:max_pairs]
     overflow = scored[max_pairs:]
 
     for cosine, (a, b) in kept:
-        # numeric_exempt pairs already logged as accepted above; avoid a
-        # duplicate "accepted" entry for the same pair.
         already_logged = any(
             e.chunk_a_id == a.chunk_id and e.chunk_b_id == b.chunk_id and e.accepted for e in log_entries
         )
@@ -273,11 +261,6 @@ def filter_by_cosine(
         )
 
     return [pair for _, pair in kept], log_entries, numeric_exemptions
-
-
-# ---------------------------------------------------------------------------
-# LLM adjudication (one batched call for all surviving pairs)
-# ---------------------------------------------------------------------------
 
 
 async def fetch_effective_dates(db: AsyncSession, document_ids: set[str]) -> dict[str, date | None]:
@@ -335,11 +318,6 @@ async def adjudicate_pairs(
     return batch, pair_id_map
 
 
-# ---------------------------------------------------------------------------
-# Verification: span check + confidence filter
-# ---------------------------------------------------------------------------
-
-
 def spans_present(verdict: ContradictionVerdict, a: ScoredChunk, b: ScoredChunk) -> bool:
     """Discard any verdict whose quoted spans are not literal substrings of
     their source chunks.
@@ -373,11 +351,6 @@ def spans_present(verdict: ContradictionVerdict, a: ScoredChunk, b: ScoredChunk)
         return norm(needle) in norm(haystack) or norm_no_space(needle) in norm_no_space(haystack)
 
     return contains(verdict.statement_a, a.text) and contains(verdict.statement_b, b.text)
-
-
-# ---------------------------------------------------------------------------
-# Upsert on fingerprint
-# ---------------------------------------------------------------------------
 
 
 async def upsert_contradiction(
@@ -510,7 +483,7 @@ async def detect_contradictions(
                 llm, kept_pairs, list(reusable_cached.values()), effective_dates
             )
         except LLMUnavailableError as exc:
-            llm_calls = 1  # an attempt was made and counted, even though it failed
+            llm_calls = 1
             kind = "rate limited" if exc.rate_limited else "unavailable"
             llm_error = f"LLM {kind}: {exc.message}"
             log.warning(
@@ -540,17 +513,10 @@ async def detect_contradictions(
 
     await _touch_cached(db, list(reusable_cached.values()))
 
-    # Cached contradictions are still valid and returned even when today's
-    # fresh LLM judgment call failed — a transient outage doesn't erase
-    # findings from previous, successful queries.
     found = list(reusable_cached.values()) + new_contradictions
     found.sort(key=lambda c: (_SEVERITY_RANK.get(c.severity, 3), -c.confidence))
 
     stage = ContradictionStage(
-        # True whenever the pipeline mechanics themselves ran (pairs were
-        # formed, cache/cosine completed) — independent of whether the LLM
-        # judgment call succeeded. `error` (not `enabled`) is what tells
-        # the caller a fresh judgment couldn't be obtained this time.
         enabled=True,
         pairs_generated=total_pairs,
         pairs_after_same_doc_filter=pairs_after_same_doc_filter,
@@ -570,11 +536,6 @@ async def detect_contradictions(
     )
 
     return found, stage
-
-
-# ---------------------------------------------------------------------------
-# API-shape conversion
-# ---------------------------------------------------------------------------
 
 
 async def build_contradiction_views(db: AsyncSession, records: list[Contradiction]) -> dict[str, ContradictionOut]:
@@ -622,10 +583,6 @@ async def build_contradiction_views(db: AsyncSession, records: list[Contradictio
         for r in records
     }
 
-
-# ---------------------------------------------------------------------------
-# GET /api/contradictions, GET /{id}, PATCH /{id}
-# ---------------------------------------------------------------------------
 
 _VALID_STATUSES = ("open", "resolved", "false_positive")
 
@@ -717,28 +674,10 @@ async def update_contradiction_status(
     if status == "resolved":
         record.resolved_at = datetime.now(timezone.utc)
     elif status == "open":
-        # Reopening clears any prior resolution timestamp — it's not
-        # resolved anymore, so a stale resolved_at would be misleading.
         record.resolved_at = None
-    # false_positive: resolved_at is left as-is (untouched by this
-    # transition); suppression is what future queries actually respect —
-    # see gather_candidate_pairs.
     await db.commit()
     await db.refresh(record)
     return record
-
-
-# ---------------------------------------------------------------------------
-# Cross-pair grouping
-#
-# Pairwise comparison across N>2 documents that disagree on the same fact
-# produces C(N,2) distinct, individually-correct Contradiction rows — that
-# is not duplication (each has a unique fingerprint and a unique chunk
-# pair; verified directly against real data before writing this). It IS,
-# however, the same underlying conflict shown N times. This groups them
-# for display while keeping every individual pairwise record intact and
-# addressable (PATCH still targets an evidence item's own id).
-# ---------------------------------------------------------------------------
 
 
 def group_contradictions(records: list[Contradiction]) -> list[list[Contradiction]]:
@@ -805,23 +744,12 @@ async def build_contradiction_group_views(db: AsyncSession, records: list[Contra
         primary_view = views_by_id[str(primary.id)]
 
         statuses = {c.status for c in cluster}
-        # "open" wins if any member is still open — there's still an
-        # unreviewed conflict here even if some evidence was separately
-        # resolved. false_positive members never reach this point at all
-        # (suppressed upstream in gather_candidate_pairs), so in practice
-        # the only other case is a uniformly-resolved cluster.
         group_status = "open" if "open" in statuses else primary.status
 
         most_severe = min(cluster, key=lambda c: _SEVERITY_RANK.get(c.severity, 3))
 
         group_id = hashlib.sha256(",".join(sorted(str(c.id) for c in cluster)).encode()).hexdigest()[:16]
 
-        # Trimmed relative to views_by_id's ContradictionOut: type/severity/
-        # status are the grouping key (identical across a group's evidence
-        # by construction) and explanation/reconciliation are already shown
-        # once at the group level above — repeating them per evidence item
-        # is pure payload bloat. Full per-pair detail is still one call
-        # away via GET /api/contradictions/{id}.
         evidence_items = [
             ContradictionEvidenceItem(
                 id=views_by_id[str(c.id)].id,

@@ -57,10 +57,8 @@ async def test_retries_on_429_then_succeeds(capsys):
 
     assert result == "finally"
     assert client._http.post.await_count == 3
-    # structlog prints via PrintLoggerFactory (stdout), not stdlib logging,
-    # so capsys — not caplog — is what sees it.
     out = capsys.readouterr().out
-    assert out.count("llm_retry") == 2  # visible backoff before attempts 2 and 3
+    assert out.count("llm_retry") == 2
     assert "wait_s=" in out
 
 
@@ -84,7 +82,7 @@ async def test_exhausted_retries_raise_llm_unavailable_error():
         await client.complete(system="s", user="u")
 
     assert exc_info.value.rate_limited is True
-    assert client._http.post.await_count == 3  # stop_after_attempt(3), no 4th try
+    assert client._http.post.await_count == 3
 
 
 async def test_non_retryable_client_error_fails_immediately():
@@ -95,7 +93,6 @@ async def test_non_retryable_client_error_fails_immediately():
     with pytest.raises(LLMUnavailableError) as exc_info:
         await client.complete(system="s", user="u")
 
-    # a 401 is not retryable — must fail on the very first attempt
     assert client._http.post.await_count == 1
     assert exc_info.value.rate_limited is False
 

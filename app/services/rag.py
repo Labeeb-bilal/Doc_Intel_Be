@@ -27,9 +27,6 @@ from app.schemas import (
 
 log = structlog.get_logger("rag")
 
-# Models naturally group a claim's citations into one bracket, e.g.
-# "[S1, S2, S3]" as well as single "[S1]" — both are matched, and each
-# marker inside a group is validated individually.
 _CITATION_GROUP_RE = re.compile(r"\[(S\d+(?:\s*,\s*S\d+)*)\]")
 _MARKER_RE = re.compile(r"S\d+")
 
@@ -168,9 +165,6 @@ def _not_found_result(result: RetrievalResult) -> dict:
 async def _run_contradiction_branch(
     db: AsyncSession, llm: LLMClient, result: RetrievalResult
 ) -> tuple[list[ContradictionGroupOut], ContradictionStage]:
-    # Imported here, not at module level: services/contradictions.py does
-    # not import services/rag.py, but keeping this import local avoids any
-    # future risk of a circular import as both modules grow.
     from app.services import contradictions as contradictions_service
 
     settings = get_settings()
@@ -184,12 +178,6 @@ async def _run_contradiction_branch(
         max_pairs=settings.contradiction_max_pairs,
         min_confidence=settings.contradiction_min_confidence,
     )
-    # Grouped here (not in chat.py) because this coroutine already owns
-    # `db` for the whole branch — the answer branch never touches it, so
-    # there's no concurrent-session hazard adding more queries here.
-    # N documents disagreeing pairwise on one fact produces C(N,2) real,
-    # distinct pairwise rows; this groups them into one displayed conflict
-    # per underlying disagreement, without discarding any evidence.
     groups = await contradictions_service.build_contradiction_group_views(db, found)
     return groups, stage
 
@@ -208,9 +196,6 @@ async def _answer_with_contradictions(
         return_exceptions=True,
     )
 
-    # The answer branch has no condition and is the only failure that
-    # produces an error response — let it propagate to the caller (chat.py
-    # maps LLMUnavailableError to a 503).
     if isinstance(answer_outcome, BaseException):
         raise answer_outcome
 
@@ -245,9 +230,6 @@ async def _answer_with_contradictions(
 
     groups, stage = contradiction_outcome
     result.trace.contradiction_check = stage
-    # Capped by distinct GROUP count, not raw pairwise-record count — this
-    # is what "showing 5 of 8" should mean: 8 real, distinct conflicts,
-    # not 8 pairwise rows where several are the same conflict restated.
     answer_outcome["contradictions"] = groups[: settings.contradiction_max_response]
     answer_outcome["contradictions_total"] = len(groups)
     return answer_outcome

@@ -17,7 +17,7 @@ async def send_chat_message(payload: ChatRequest, db: AsyncSession = Depends(get
     options = payload.options
     result = await chat_service.send_message(
         db,
-        None,  # resolved inside send_message so a missing key hits the same 503 path as a mid-call failure
+        None,
         query=payload.query,
         conversation_id=payload.conversation_id,
         history=payload.history,
