@@ -19,6 +19,7 @@ htmlcov/
 storage/
 
 scripts/
+tests/
 
 .vscode/
 .idea/
