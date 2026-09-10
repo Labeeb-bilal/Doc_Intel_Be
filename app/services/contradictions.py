@@ -1,17 +1,47 @@
-"""Contradiction detection service. Every threshold, batch size, and
-ordering decision for turning a set of retrieved chunks into verified
-contradiction verdicts lives here.
+"""Contradiction detection service — the second half of the RAG pipeline
+that runs alongside answer generation, on the same retrieved chunks.
 
-Pipeline:
-  form pairs -> drop same-document -> fingerprint -> cache lookup
-  -> false_positive suppression -> cosine bounds + numeric exemption
-  -> batched LLM -> span verification -> confidence filter -> upsert
-  -> sort by severity then confidence
+This is a separate concern from answer generation on purpose: the answer
+LLM's job is "write a grounded answer to the user's question"; this
+module's job is "do any two of these chunks disagree with each other?".
+They share input (the same selected chunks) but never share code.
+
+Pipeline (`detect_contradictions()` runs every step below, in order):
+
+  selected chunks
+      |
+      v
+  1. generate_candidate_pairs()  -- every unordered pair, same-document
+      |                             pairs dropped immediately
+      v
+  2. gather_candidate_pairs()    -- fingerprint each pair, reuse cached
+      |                             verdicts (if still within today's
+      |                             CONTRADICTION_SIM_MIN/MAX -- see
+      |                             cache_still_valid), suppress
+      |                             false_positives
+      v
+  3. filter_similar_pairs()      -- cosine similarity bounds: is this pair
+      |                             even worth asking the LLM about?
+      v
+  4. adjudicate_pairs()          -- ONE batched call to the contradiction
+      |                             LLM for every pair that survived step 3
+      v
+  5. verify_contradiction_evidence() -- reject any verdict whose quoted
+      |                                 evidence isn't real chunk text
+      v
+  6. confidence threshold check  -- reject verdicts below min_confidence
+      |
+      v
+  7. upsert_contradiction()      -- persist genuine, verified verdicts
+      |
+      v
+  found contradictions, sorted by severity then confidence
 
 `detect_contradictions()` is the single entry point services/rag.py calls,
 inside asyncio.gather(..., return_exceptions=True) alongside the answer
 generation branch — this module never wraps its own errors, so a failure
-here propagates naturally for the caller to catch.
+here propagates naturally for the caller to catch (see rag.py: a failure
+here must never take down the user-facing answer).
 """
 from __future__ import annotations
 
@@ -64,26 +94,30 @@ def fingerprint(chunk_a_id: str, chunk_b_id: str) -> str:
     return hashlib.sha256(f"{a}|{b}".encode()).hexdigest()
 
 
-def form_pairs(chunks: list[ScoredChunk]) -> tuple[list[ChunkPair], list[PairDecision]]:
-    """Unordered pairs from the selected chunks, with same-document pairs
-    dropped immediately.
+def _decision(
+    a: ScoredChunk, b: ScoredChunk, *, cosine: float | None, accepted: bool, reason: str
+) -> PairDecision:
+    """Build one filter_log entry. Centralizing this avoids re-typing the
+    same four-field PairDecision(...) call at every filter stage below."""
+    return PairDecision(chunk_a_id=a.chunk_id, chunk_b_id=b.chunk_id, cosine=cosine, accepted=accepted, reason=reason)
 
-    This goes first, before fingerprinting or any cache/cosine work,
-    because it's a free ID comparison and because within one document,
-    similar-sounding chunks are elaboration of the same point, not
-    conflicting claims — two chunks from the same source were written by
-    the same author to agree with each other.
+
+def generate_candidate_pairs(chunks: list[ScoredChunk]) -> tuple[list[ChunkPair], list[PairDecision]]:
+    """Step 1 of the pipeline: every unordered pair of selected chunks,
+    with same-document pairs dropped immediately.
+
+    Same-document pairs are dropped here — first, before fingerprinting or
+    any similarity/LLM work — because it's a free ID comparison and
+    because within one document, similar-sounding chunks are elaboration
+    of the same point, not conflicting claims: two chunks from the same
+    source were written by the same author to agree with each other.
     """
     survivors: list[ChunkPair] = []
     log_entries: list[PairDecision] = []
 
     for a, b in itertools.combinations(chunks, 2):
         if a.document_id == b.document_id:
-            log_entries.append(
-                PairDecision(
-                    chunk_a_id=a.chunk_id, chunk_b_id=b.chunk_id, cosine=None, accepted=False, reason="same_document"
-                )
-            )
+            log_entries.append(_decision(a, b, cosine=None, accepted=False, reason="same_document"))
             continue
         survivors.append((a, b))
 
@@ -91,10 +125,17 @@ def form_pairs(chunks: list[ScoredChunk]) -> tuple[list[ChunkPair], list[PairDec
 
 
 async def fetch_cached_verdicts(db: AsyncSession, fingerprints: list[str]) -> dict[str, Contradiction]:
-    """One DB query for every fingerprint in this batch — not one query
-    per pair. Cache is ground truth: a pair a user has already marked
+    """The cache key is "chunk_a + chunk_b" (see fingerprint()), not the
+    user's question. It answers "have we already judged whether THESE TWO
+    PIECES OF EVIDENCE conflict?" — not "have we already answered this
+    query?". The same chunk pair can turn up again for a completely
+    different question and still reuse the same verdict.
+
+    One DB query for every fingerprint in this batch — not one query per
+    pair. Cache is ground truth: a pair a user has already marked
     false_positive (or resolved) must never be re-adjudicated by the
-    heuristic or the LLM, so this lookup happens before either runs."""
+    similarity filter or the LLM, so this lookup happens before either
+    runs."""
     if not fingerprints:
         return {}
     stmt = select(Contradiction).where(Contradiction.fingerprint.in_(fingerprints))
@@ -103,22 +144,32 @@ async def fetch_cached_verdicts(db: AsyncSession, fingerprints: list[str]) -> di
 
 
 async def gather_candidate_pairs(
-    db: AsyncSession, chunks: list[ScoredChunk]
+    db: AsyncSession, chunks: list[ScoredChunk], *, sim_min: float, sim_max: float
 ) -> tuple[list[ChunkPair], dict[str, Contradiction], list[PairDecision]]:
-    """Same-doc filter -> fingerprint -> cache lookup -> false_positive
-    suppression. Returns the pairs that still need further filtering
-    (cosine, next stage), the *reusable* cached verdicts for this batch
-    keyed by fingerprint (open/resolved only), and the filter log entries
-    generated so far.
+    """Step 2: same-doc filter (step 1) -> fingerprint each remaining pair
+    -> look up the cache -> suppress false_positive pairs -> validate
+    whatever's left against today's similarity thresholds. Returns the
+    pairs that still need similarity filtering (next stage — this now
+    includes cache hits invalidated by a threshold change, not just
+    never-seen pairs), the *reusable* cached verdicts for this batch keyed
+    by fingerprint (open/resolved, and still within today's thresholds
+    only), and the filter log entries generated so far.
 
     false_positive pairs are deliberately excluded from both return
     values: they are in the cache (so `fetch_cached_verdicts` finds them),
     but a user's false_positive call must suppress the pair everywhere —
     it must not be reused as a finding, and it must not fall through to
-    cosine/LLM either. This is the suppression check the spec places
-    between the cache check and cosine computation.
+    similarity/LLM either. This is the suppression check the spec places
+    between the cache check and the similarity check. Note this check
+    happens BEFORE the threshold-validity check below: suppression is a
+    human decision and stays permanent regardless of what
+    CONTRADICTION_SIM_MIN/MAX happen to be today.
+
+    `sim_min`/`sim_max` are only used here to validate a cache HIT (see
+    cache_still_valid) — they don't change which pairs exist, only whether
+    an already-cached verdict is still trusted or gets treated as a miss.
     """
-    pairs, log_entries = form_pairs(chunks)
+    pairs, log_entries = generate_candidate_pairs(chunks)
 
     fp_to_pair: dict[str, ChunkPair] = {fingerprint(a.chunk_id, b.chunk_id): (a, b) for a, b in pairs}
     cached = await fetch_cached_verdicts(db, list(fp_to_pair.keys()))
@@ -130,22 +181,15 @@ async def gather_candidate_pairs(
         if cached_row is None:
             uncached_pairs.append((a, b))
         elif cached_row.status == "false_positive":
+            log_entries.append(_decision(a, b, cosine=None, accepted=False, reason="false_positive_suppressed"))
+        elif not cache_still_valid(cached_row.cosine, a, b, sim_min=sim_min, sim_max=sim_max):
+            uncached_pairs.append((a, b))
             log_entries.append(
-                PairDecision(
-                    chunk_a_id=a.chunk_id,
-                    chunk_b_id=b.chunk_id,
-                    cosine=None,
-                    accepted=False,
-                    reason="false_positive_suppressed",
-                )
+                _decision(a, b, cosine=cached_row.cosine, accepted=False, reason="cache_invalid_threshold_changed")
             )
         else:
             reusable_cached[fp] = cached_row
-            log_entries.append(
-                PairDecision(
-                    chunk_a_id=a.chunk_id, chunk_b_id=b.chunk_id, cosine=None, accepted=True, reason="cached_verdict"
-                )
-            )
+            log_entries.append(_decision(a, b, cosine=None, accepted=True, reason="cached_verdict"))
 
     return uncached_pairs, reusable_cached, log_entries
 
@@ -166,104 +210,127 @@ def numeric_tokens(text: str) -> set[str]:
     return set(_NUMERIC_TOKEN_RE.findall(text))
 
 
-def passes_upper_bound(cosine: float, sim_max: float, a: str, b: str) -> bool:
-    """Near-identical text (cosine > sim_max) is boilerplate copied between
-    documents, not a conflict — this is the highest-yield false-positive
-    filter; without it, shared standard clauses get flagged constantly.
+def passes_upper_bound(pair_similarity: float, max_similarity: float, a: str, b: str) -> bool:
+    """Near-identical text (pair_similarity > max_similarity) is boilerplate
+    copied between documents, not a conflict — this is the highest-yield
+    false-positive filter; without it, shared standard clauses get flagged
+    constantly.
 
     The one exception: near-identical wording with different numbers is
     the classic numerical contradiction ("$50 per transaction" vs "$75 per
     transaction" reads as near-duplicate text). If the numeric tokens in
     the two chunks differ, let the pair through regardless of how high the
-    cosine is — the number is exactly what might be in conflict.
+    similarity is — the number is exactly what might be in conflict.
     """
-    if cosine > sim_max:
+    if pair_similarity > max_similarity:
         return numeric_tokens(a) != numeric_tokens(b)
     return True
 
 
-def filter_by_cosine(
+def cache_still_valid(stored_cosine: float | None, a: ScoredChunk, b: ScoredChunk, *, sim_min: float, sim_max: float) -> bool:
+    """A cached verdict is only trustworthy if the cosine it was stored
+    with would STILL clear today's CONTRADICTION_SIM_MIN/MAX — if those
+    thresholds changed since the pair was first adjudicated, the cached
+    pair might now fall outside them, and cache-before-cosine would
+    otherwise keep surfacing that stale verdict regardless of the current
+    configuration.
+
+    None means the row predates this column (or is some other cache entry
+    that never computed one) — always a miss, never treated as "valid
+    because unknown".
+
+    Deliberately mirrors filter_similar_pairs' own bound check exactly,
+    numeric exemption included (via passes_upper_bound), rather than a
+    bare `sim_min <= stored_cosine <= sim_max`. Without the exemption, a
+    legitimately-cached numeric-exempt pair — one whose cosine is, BY
+    DESIGN, above sim_max — would be wrongly invalidated on every single
+    lookup even with unchanged thresholds, forcing a needless LLM call
+    every time and defeating caching for that entire class of pairs.
+    """
+    if stored_cosine is None:
+        return False
+    if stored_cosine < sim_min:
+        return False
+    if stored_cosine > sim_max:
+        return passes_upper_bound(stored_cosine, sim_max, a.text, b.text)
+    return True
+
+
+def filter_similar_pairs(
     pairs: list[ChunkPair], *, sim_min: float, sim_max: float, max_pairs: int
 ) -> tuple[list[ChunkPair], list[PairDecision], int]:
-    """Cosine bounds on vectors already sitting on ScoredChunk (no
-    re-embedding), then a hard cap on pair count.
+    """Step 3 of the pipeline. IMPORTANT: this function does not decide
+    whether two chunks contradict each other — only the contradiction LLM
+    (adjudicate_pairs, next stage) makes that call. This step only answers
+    a cheaper, upstream question: "are these two chunks talking about the
+    same thing closely enough that it's even worth asking the LLM?" —
+    using cosine similarity between their embedding vectors (already on
+    ScoredChunk from retrieval, no re-embedding needed) as that proxy.
 
-    Lower bound (sim_min): below this the chunks address different topics
-    entirely and cannot contradict — there's no shared claim to conflict
-    over. Upper bound (sim_max): see passes_upper_bound. Cap: bounds
-    worst-case token cost and judgment quality — models adjudicate 8 pairs
-    more reliably than 20.
+    Two similarity bounds, plus a hard cap on how many pairs go to the LLM:
+
+    - sim_min (lower bound): below this, the chunks are about different
+      topics entirely and cannot contradict — there's no shared claim to
+      conflict over.
+    - sim_max (upper bound): above this, the wording is near-identical —
+      almost certainly boilerplate copied between documents, not a real
+      conflict. See passes_upper_bound() for the one exception (numbers
+      differ) that lets a near-identical pair through anyway.
+    - max_pairs (cap): bounds worst-case LLM token cost and judgment
+      quality — a model adjudicates 8 pairs more reliably than 20.
     """
     scored: list[tuple[float, ChunkPair]] = []
     log_entries: list[PairDecision] = []
+    numeric_exempt_ids: set[tuple[str, str]] = set()
     numeric_exemptions = 0
 
     for a, b in pairs:
         if a.vector is None or b.vector is None:
+            log_entries.append(_decision(a, b, cosine=None, accepted=False, reason="no_vector"))
+            continue
+
+        pair_similarity = cosine_similarity(a.vector, b.vector)
+
+        if pair_similarity < sim_min:
             log_entries.append(
-                PairDecision(
-                    chunk_a_id=a.chunk_id, chunk_b_id=b.chunk_id, cosine=None, accepted=False, reason="no_vector"
-                )
+                _decision(a, b, cosine=pair_similarity, accepted=False, reason="similarity_below_threshold")
             )
             continue
 
-        cosine = cosine_similarity(a.vector, b.vector)
-
-        if cosine < sim_min:
-            log_entries.append(
-                PairDecision(
-                    chunk_a_id=a.chunk_id,
-                    chunk_b_id=b.chunk_id,
-                    cosine=cosine,
-                    accepted=False,
-                    reason="similarity_below_threshold",
-                )
-            )
-            continue
-
-        if cosine > sim_max:
-            if not passes_upper_bound(cosine, sim_max, a.text, b.text):
-                log_entries.append(
-                    PairDecision(
-                        chunk_a_id=a.chunk_id, chunk_b_id=b.chunk_id, cosine=cosine, accepted=False, reason="near_duplicate"
-                    )
-                )
+        if pair_similarity > sim_max:
+            if not passes_upper_bound(pair_similarity, sim_max, a.text, b.text):
+                log_entries.append(_decision(a, b, cosine=pair_similarity, accepted=False, reason="near_duplicate"))
                 continue
             numeric_exemptions += 1
-            log_entries.append(
-                PairDecision(
-                    chunk_a_id=a.chunk_id, chunk_b_id=b.chunk_id, cosine=cosine, accepted=True, reason="numeric_exempt"
-                )
-            )
-            scored.append((cosine, (a, b)))
+            numeric_exempt_ids.add((a.chunk_id, b.chunk_id))
+            log_entries.append(_decision(a, b, cosine=pair_similarity, accepted=True, reason="numeric_exempt"))
+            scored.append((pair_similarity, (a, b)))
             continue
 
-        scored.append((cosine, (a, b)))
+        scored.append((pair_similarity, (a, b)))
 
     scored.sort(key=lambda item: item[0], reverse=True)
     kept = scored[:max_pairs]
     overflow = scored[max_pairs:]
 
-    for cosine, (a, b) in kept:
-        already_logged = any(
-            e.chunk_a_id == a.chunk_id and e.chunk_b_id == b.chunk_id and e.accepted for e in log_entries
-        )
-        if not already_logged:
-            log_entries.append(
-                PairDecision(chunk_a_id=a.chunk_id, chunk_b_id=b.chunk_id, cosine=cosine, accepted=True, reason="accepted")
-            )
+    for pair_similarity, (a, b) in kept:
+        if (a.chunk_id, b.chunk_id) not in numeric_exempt_ids:
+            log_entries.append(_decision(a, b, cosine=pair_similarity, accepted=True, reason="accepted"))
 
-    for cosine, (a, b) in overflow:
-        log_entries.append(
-            PairDecision(
-                chunk_a_id=a.chunk_id, chunk_b_id=b.chunk_id, cosine=cosine, accepted=False, reason="over_pair_limit"
-            )
-        )
+    for pair_similarity, (a, b) in overflow:
+        log_entries.append(_decision(a, b, cosine=pair_similarity, accepted=False, reason="over_pair_limit"))
 
     return [pair for _, pair in kept], log_entries, numeric_exemptions
 
 
 async def fetch_effective_dates(db: AsyncSession, document_ids: set[str]) -> dict[str, date | None]:
+    """Effective dates get passed into the LLM prompt alongside each chunk
+    (see _chunk_block below) so the model can tell "policy A, dated 2023"
+    from "policy B, dated 2024" and decide the newer one supersedes the
+    older one (reconciliation="supersedes") when both describe the same
+    rule. There is no separate document-authority ranking in this codebase
+    — the LLM makes that call itself, from the dates and text it's shown;
+    see CONTRADICTION_SYSTEM_PROMPT's TEMPORAL HANDLING section."""
     if not document_ids:
         return {}
     stmt = select(Document.id, Document.effective_date).where(
@@ -318,9 +385,11 @@ async def adjudicate_pairs(
     return batch, pair_id_map
 
 
-def spans_present(verdict: ContradictionVerdict, a: ScoredChunk, b: ScoredChunk) -> bool:
-    """Discard any verdict whose quoted spans are not literal substrings of
-    their source chunks.
+def verify_contradiction_evidence(verdict: ContradictionVerdict, a: ScoredChunk, b: ScoredChunk) -> bool:
+    """Step 5: the contradiction LLM can fabricate or paraphrase the quotes
+    it claims to be citing, so before trusting a verdict we check that its
+    quoted statement_a/statement_b are literal substrings of the actual
+    source chunks — not just plausible-sounding text the model invented.
 
     Honest scope: chunk text here is the exact same payload the model was
     shown, so this catches hallucinated or paraphrased quotes — it is a
@@ -354,7 +423,7 @@ def spans_present(verdict: ContradictionVerdict, a: ScoredChunk, b: ScoredChunk)
 
 
 async def upsert_contradiction(
-    db: AsyncSession, verdict: ContradictionVerdict, a: ScoredChunk, b: ScoredChunk, query: str
+    db: AsyncSession, verdict: ContradictionVerdict, a: ScoredChunk, b: ScoredChunk, query: str, cosine: float
 ) -> Contradiction:
     """Only genuine (is_contradiction=true, verified, confident) verdicts
     are ever stored — the `contradictions` table's name and status
@@ -364,10 +433,23 @@ async def upsert_contradiction(
     against inventing a second "confirmed-not-a-conflict" cache the given
     schema has no room for.
 
-    On rediscovery: increment times_seen, bump last_seen_at, and — this is
-    the important part — never touch status. A contradiction a user
+    `cosine` is today's freshly-computed similarity for this pair (see
+    detect_contradictions) — stored so a future cache lookup can validate
+    the verdict against CONTRADICTION_SIM_MIN/MAX at that time (see
+    cache_still_valid). On rediscovery this always gets refreshed, even
+    for a pair reaching this function again after its old cached cosine
+    was invalidated by a threshold change: the row's `cosine` should
+    reflect the value that just got it here, not a stale one.
+
+    On rediscovery: increment times_seen, bump last_seen_at, refresh the
+    stored cosine, and — this is the important part — leave `status`
+    alone once it's resolved or false_positive. A contradiction a user
     already resolved or marked false_positive must stay that way no
-    matter how many more times the same pair turns up.
+    matter how many more times the same pair turns up (whether that's an
+    ordinary re-sighting from cache, or a fresh re-adjudication after its
+    cache entry was invalidated by a threshold change). An "open" record
+    is simply re-confirmed as open — not a behavior change, just explicit
+    about the one status this function is actually allowed to (re)write.
     """
     fp = fingerprint(a.chunk_id, b.chunk_id)
     existing = await db.scalar(select(Contradiction).where(Contradiction.fingerprint == fp))
@@ -376,6 +458,9 @@ async def upsert_contradiction(
     if existing is not None:
         existing.times_seen += 1
         existing.last_seen_at = now
+        existing.cosine = cosine
+        if existing.status not in ("resolved", "false_positive"):
+            existing.status = "open"
         await db.commit()
         await db.refresh(existing)
         return existing
@@ -386,6 +471,7 @@ async def upsert_contradiction(
         chunk_b_id=uuid.UUID(b.chunk_id),
         document_a_id=uuid.UUID(a.document_id),
         document_b_id=uuid.UUID(b.document_id),
+        cosine=cosine,
         statement_a=verdict.statement_a,
         statement_b=verdict.statement_b,
         type=verdict.type,
@@ -456,16 +542,16 @@ async def detect_contradictions(
     start = time.perf_counter()
 
     total_pairs = len(chunks) * (len(chunks) - 1) // 2
-    uncached_pairs, reusable_cached, log_entries = await gather_candidate_pairs(db, chunks)
+    uncached_pairs, reusable_cached, log_entries = await gather_candidate_pairs(db, chunks, sim_min=sim_min, sim_max=sim_max)
 
     same_doc_count = sum(1 for e in log_entries if e.reason == "same_document")
     fp_suppressed = sum(1 for e in log_entries if e.reason == "false_positive_suppressed")
     pairs_after_same_doc_filter = total_pairs - same_doc_count
 
-    kept_pairs, cosine_log, numeric_exemptions = filter_by_cosine(
+    kept_pairs, similarity_log, numeric_exemptions = filter_similar_pairs(
         uncached_pairs, sim_min=sim_min, sim_max=sim_max, max_pairs=max_pairs
     )
-    log_entries.extend(cosine_log)
+    log_entries.extend(similarity_log)
 
     llm_calls = 0
     verdicts_returned = 0
@@ -502,13 +588,14 @@ async def detect_contradictions(
                 if pair is None or not verdict.is_contradiction:
                     continue
                 a, b = pair
-                if not spans_present(verdict, a, b):
+                if not verify_contradiction_evidence(verdict, a, b):
                     verdicts_rejected_span_check += 1
                     continue
                 if verdict.confidence < min_confidence:
                     verdicts_below_confidence += 1
                     continue
-                record = await upsert_contradiction(db, verdict, a, b, query)
+                pair_cosine = cosine_similarity(a.vector, b.vector)
+                record = await upsert_contradiction(db, verdict, a, b, query, pair_cosine)
                 new_contradictions.append(record)
 
     await _touch_cached(db, list(reusable_cached.values()))
@@ -611,19 +698,12 @@ async def _fetch_all_matching_contradictions(
         doc_uuid = uuid.UUID(document_id)
         filters.append(or_(Contradiction.document_a_id == doc_uuid, Contradiction.document_b_id == doc_uuid))
 
-    list_filters = list(filters)
-    if status:
-        list_filters.append(Contradiction.status == status)
+    list_filters = [*filters, Contradiction.status == status] if status else filters
 
-    stmt = select(Contradiction)
-    for f in list_filters:
-        stmt = stmt.where(f)
-    stmt = stmt.order_by(Contradiction.created_at.desc())
+    stmt = select(Contradiction).where(*list_filters).order_by(Contradiction.created_at.desc())
     records = list((await db.execute(stmt)).scalars().all())
 
-    counts_stmt = select(Contradiction.status, func.count()).group_by(Contradiction.status)
-    for f in filters:
-        counts_stmt = counts_stmt.where(f)
+    counts_stmt = select(Contradiction.status, func.count()).where(*filters).group_by(Contradiction.status)
     status_rows = (await db.execute(counts_stmt)).all()
     counts = {"open": 0, "resolved": 0, "false_positive": 0}
     counts.update({row[0]: row[1] for row in status_rows})

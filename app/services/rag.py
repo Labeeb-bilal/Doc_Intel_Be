@@ -1,6 +1,35 @@
 """RAG service — context assembly, answer generation, and citation
 validation. services/retrieval.py never calls the LLM; this is the one
 place that does, and the one place that decides whether to call it at all.
+
+Entry point is answer(). It picks up where retrieval left off (a
+RetrievalResult with `selected` chunks already ranked) and does this:
+
+    selected chunks (from services/retrieval.py)
+        |
+        v
+    no chunks cleared the relevance floor? -> return "not found", no LLM call
+        |
+        v
+    build the [S1]/[S2]/... labeled context block  (_build_context)
+        |
+        +----------------------------+
+        |                            |
+        v                            v
+    generate the answer         detect contradictions
+    (_generate_answer)          (contradictions_service.detect_contradictions)
+    - one LLM call               - same selected chunks, separate pipeline
+    - validate citations          - never affects the answer LLM's prompt
+        |                            |
+        +----------------------------+
+        |
+        v
+    combine into one response: {answer, citations, contradictions, ...}
+
+The two branches run concurrently via asyncio.gather() and never share
+state — see _run_answer_and_contradictions() below. If contradiction
+detection fails, the answer is still returned; if answer generation
+fails, the whole request fails (see failure-isolation note there).
 """
 from __future__ import annotations
 
@@ -42,7 +71,7 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def _assemble_context(
+def _build_context(
     selected: list[ScoredChunk], max_tokens: int
 ) -> tuple[str, dict[str, ScoredChunk], int, bool]:
     """Builds the [S1]/[S2]/... labeled context block. `selected` is
@@ -112,10 +141,16 @@ def _validate_citations(answer_text: str, source_map: dict[str, ScoredChunk]) ->
 
 
 async def _generate_answer(llm: LLMClient, result: RetrievalResult, history: list[HistoryMessage]) -> dict:
+    """The answer LLM's whole job, start to finish: build the labeled
+    context block from the selected chunks, prompt the model, then
+    validate that every citation it produced actually points at a real
+    source (never trust the model's markers blindly). This function does
+    not know contradiction detection exists — that's a separate pipeline
+    in services/contradictions.py, run alongside this one, never inside it."""
     settings = get_settings()
     overall_start = time.perf_counter()
 
-    context_block, source_map, total_tokens, truncated = _assemble_context(
+    context_block, source_map, total_tokens, truncated = _build_context(
         result.selected, settings.max_context_tokens
     )
     result.trace.context = ContextStage(
@@ -162,9 +197,12 @@ def _not_found_result(result: RetrievalResult) -> dict:
     return {"answer": NOT_FOUND_ANSWER, "citations": [], "grounded": False, "contradictions": [], "contradictions_total": 0}
 
 
-async def _run_contradiction_branch(
+async def _run_contradiction_detection(
     db: AsyncSession, llm: LLMClient, result: RetrievalResult
 ) -> tuple[list[ContradictionGroupOut], ContradictionStage]:
+    """Runs the whole contradiction pipeline (services/contradictions.py)
+    on the same selected chunks the answer LLM is using, then groups the
+    raw pairwise findings into one entry per underlying conflict."""
     from app.services import contradictions as contradictions_service
 
     settings = get_settings()
@@ -182,18 +220,23 @@ async def _run_contradiction_branch(
     return groups, stage
 
 
-async def _answer_with_contradictions(
+async def _run_answer_and_contradictions(
     llm: LLMClient, result: RetrievalResult, db: AsyncSession, history: list[HistoryMessage]
 ) -> dict:
-    """The execution model: two branches run concurrently off the same
-    RetrievalResult, neither gates the other. return_exceptions=True is
-    mandatory — a contradiction failure must never cancel the answer."""
+    """Runs the answer LLM and the contradiction pipeline as two
+    independent asyncio tasks (answer_task, contradiction_task) off the
+    same selected chunks, then combines their results into one response.
+
+    Neither task gates the other, and return_exceptions=True is mandatory:
+    a contradiction-detection failure must never cancel the answer (see
+    failure handling below) — the two are deliberately kept in separate
+    modules and neither calls into the other."""
     settings = get_settings()
 
+    answer_task = _generate_answer(llm, result, history)
+    contradiction_task = _run_contradiction_detection(db, llm, result)
     answer_outcome, contradiction_outcome = await asyncio.gather(
-        _generate_answer(llm, result, history),
-        _run_contradiction_branch(db, llm, result),
-        return_exceptions=True,
+        answer_task, contradiction_task, return_exceptions=True
     )
 
     if isinstance(answer_outcome, BaseException):
@@ -260,5 +303,5 @@ async def answer(
     if not result.selected:
         return _not_found_result(result)
     if db is not None and detect_contradictions:
-        return await _answer_with_contradictions(llm, result, db, history)
+        return await _run_answer_and_contradictions(llm, result, db, history)
     return await _generate_answer(llm, result, history)

@@ -368,9 +368,13 @@ class ContradictionStage(BaseModel):
 
 
 class ContradictionStageSummary(BaseModel):
-    """Same counts as ContradictionStage, minus `filter_log` (one entry per
-    candidate pair attempted — debug detail, not something a chat UI shows).
-    The full log stays on the persisted Message row."""
+    """Same counts as ContradictionStage, minus `filter_log` (usually one
+    entry per candidate pair attempted, occasionally two — a pair whose
+    cached verdict is invalidated by a CONTRADICTION_SIM_MIN/MAX change
+    gets a "cache_invalid_threshold_changed" entry plus whatever
+    filter_similar_pairs decides for it fresh; debug detail either way,
+    not something a chat UI shows). The full log stays on the persisted
+    Message row."""
 
     enabled: bool
     pairs_generated: int

@@ -145,6 +145,7 @@ class Contradiction(Base):
     document_b_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
     )
+    cosine: Mapped[float | None] = mapped_column(DOUBLE_PRECISION, nullable=True)
     statement_a: Mapped[str] = mapped_column(Text, nullable=False)
     statement_b: Mapped[str] = mapped_column(Text, nullable=False)
     type: Mapped[str] = mapped_column(String(20), nullable=False)

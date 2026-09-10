@@ -20,7 +20,7 @@ import structlog
 from app.adapters import embeddings as embeddings_adapter
 from app.adapters import reranker as reranker_adapter
 from app.adapters import vectors as vectors_adapter
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.schemas import (
     CandidateChunk,
     RerankResultEntry,
@@ -105,6 +105,67 @@ async def _expand_neighbours(chunks: list[ScoredChunk], collection: str) -> list
     return expanded
 
 
+async def _rerank_chunks(
+    query_used: str, candidates: list[ScoredChunk], *, rerank_enabled: bool, settings: Settings
+) -> tuple[list[ScoredChunk], RerankStage | None]:
+    """Step: cross-encoder rerank, with a graceful fallback if it's
+    disabled or fails.
+
+    NOTE on ordering vs neighbour expansion: this must run BEFORE
+    neighbour expansion, never after — cross-encoders cap at ~512 tokens
+    for the (query, chunk) pair, so an already neighbour-expanded chunk
+    would silently get truncated and scored as a fragment instead of the
+    real chunk. retrieve() below enforces that ordering.
+
+    Returns the chunks in ranked order (best first) and the trace entry
+    describing what happened, or (unranked, None) when reranking is off.
+    """
+    if not rerank_enabled or not candidates:
+        if candidates:
+            return _apply_cosine_floor(candidates, settings.relevance_floor), None
+        return candidates, None
+
+    rerank_start = time.perf_counter()
+    try:
+        logits = await reranker_adapter.rerank(query_used, [c.text for c in candidates])
+        for chunk, logit in zip(candidates, logits):
+            chunk.rerank_score = reranker_adapter.sigmoid(logit)
+
+        ranked = sorted(candidates, key=lambda c: c.rerank_score, reverse=True)
+        for rank_after, chunk in enumerate(ranked):
+            chunk.rank_after = rank_after
+        rerank_latency_ms = round((time.perf_counter() - rerank_start) * 1000)
+
+        floor = settings.relevance_floor
+        kept = [c for c in ranked if c.rerank_score >= floor]
+        kept_ids = {c.chunk_id for c in kept[: settings.keep_n]}
+
+        rerank_stage = RerankStage(
+            enabled=True,
+            model=settings.rerank_model,
+            kept=len(kept),
+            latency_ms=rerank_latency_ms,
+            results=[
+                RerankResultEntry(
+                    chunk_id=c.chunk_id,
+                    vector_score=c.vector_score,
+                    rerank_score=c.rerank_score,
+                    rank_before=c.rank_before,
+                    rank_after=c.rank_after,
+                    rank_delta=c.rank_before - c.rank_after,
+                    used_in_answer=c.chunk_id in kept_ids,
+                )
+                for c in ranked
+            ],
+            dropped=[c.chunk_id for c in ranked if c.rerank_score < floor],
+        )
+        return kept, rerank_stage
+    except Exception as exc:
+        log.warning("rerank_failed", error=str(exc))
+        rerank_stage = RerankStage(enabled=False, kept=0, latency_ms=0, error=str(exc))
+        return _apply_cosine_floor(candidates, settings.relevance_floor), rerank_stage
+
+
 async def retrieve(
     query: str,
     *,
@@ -154,52 +215,7 @@ async def retrieve(
         ],
     )
 
-    rerank_stage: RerankStage | None = None
-    ranked = candidates
-
-    if rerank_enabled and candidates:
-        rerank_start = time.perf_counter()
-        try:
-            logits = await reranker_adapter.rerank(query_used, [c.text for c in candidates])
-            for chunk, logit in zip(candidates, logits):
-                chunk.rerank_score = reranker_adapter.sigmoid(logit)
-
-            ranked = sorted(candidates, key=lambda c: c.rerank_score, reverse=True)
-            for rank_after, chunk in enumerate(ranked):
-                chunk.rank_after = rank_after
-            rerank_latency_ms = round((time.perf_counter() - rerank_start) * 1000)
-
-            floor = settings.relevance_floor
-            kept = [c for c in ranked if c.rerank_score >= floor]
-            kept_ids = {c.chunk_id for c in kept[: settings.keep_n]}
-
-            rerank_stage = RerankStage(
-                enabled=True,
-                model=settings.rerank_model,
-                kept=len(kept),
-                latency_ms=rerank_latency_ms,
-                results=[
-                    RerankResultEntry(
-                        chunk_id=c.chunk_id,
-                        vector_score=c.vector_score,
-                        rerank_score=c.rerank_score,
-                        rank_before=c.rank_before,
-                        rank_after=c.rank_after,
-                        rank_delta=c.rank_before - c.rank_after,
-                        used_in_answer=c.chunk_id in kept_ids,
-                    )
-                    for c in ranked
-                ],
-                dropped=[c.chunk_id for c in ranked if c.rerank_score < floor],
-            )
-            ranked = kept
-        except Exception as exc:
-            log.warning("rerank_failed", error=str(exc))
-            rerank_stage = RerankStage(enabled=False, kept=0, latency_ms=0, error=str(exc))
-            ranked = _apply_cosine_floor(candidates, settings.relevance_floor)
-    elif candidates:
-        ranked = _apply_cosine_floor(candidates, settings.relevance_floor)
-
+    ranked, rerank_stage = await _rerank_chunks(query_used, candidates, rerank_enabled=rerank_enabled, settings=settings)
     selected = ranked[: settings.keep_n]
 
     if settings.neighbour_expansion and selected:
