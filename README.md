@@ -31,13 +31,62 @@ uvicorn app.main:app --reload
 `GET /api/health` pings Postgres and Qdrant and reports whether the
 embedding model has finished loading — it never returns a hardcoded `ok`.
 
+## Deployment
+
+`.env.example` (local dev) and `.env.production.example` (a real deploy —
+Render or otherwise) are separate templates; see the comments in the
+latter for what actually differs and why. Fill in a copy of whichever one
+applies — never commit the filled-in version, only the placeholder
+template belongs in git.
+
+`docker-compose.yml` above is dev-only (Postgres + Qdrant; the API runs on
+the host for `--reload`). `Dockerfile` builds the API itself, for an actual
+deployment against managed Postgres/Qdrant:
+
+```bash
+docker build -t doc-intelligence-api .
+
+docker run -p 8000:8000 \
+  -v /some/local/path:/storage \
+  -e DATABASE_URL=postgresql+asyncpg://user:pass@host/db?ssl=require \
+  -e QDRANT_URL=https://xxx.qdrant.io \
+  -e QDRANT_API_KEY=your_key \
+  -e GROQ_API_KEY=your_key \
+  doc-intelligence-api
+```
+
+- `DATABASE_URL`: for a managed Postgres that requires TLS (Neon and
+  similar), the query param has to be `?ssl=require`, **not**
+  `?sslmode=require` — the latter is the libpq/psycopg convention most
+  providers show you by default in their dashboard, but this app's driver
+  (asyncpg) doesn't accept a `sslmode` kwarg at all and raises before it
+  even attempts to connect. Verified directly against the installed
+  driver, not assumed.
+- `-v ...:/storage` mounts a host directory (or, on Render/Railway, their
+  persistent disk) at the path `STORAGE_LOCAL_PATH` is set to inside the
+  image — see the Dockerfile — so uploaded files survive a container
+  restart or redeploy. Only relevant when `STORAGE_BACKEND=local` (the
+  default); switch to `s3` + the `S3_*` vars instead for a stateless
+  container with no volume at all.
+- `QDRANT_API_KEY` is optional — unset (the local docker-compose Qdrant
+  has no auth) or set (Qdrant Cloud requires it).
+- The embedding + reranker models are baked into the image at build time
+  (see the Dockerfile's `FASTEMBED_CACHE_PATH` step), so a fresh container
+  starts serving immediately instead of downloading ~230MB on first
+  request.
+
 ## Known gaps (deliberate, for a project this size)
 
 - **No Alembic / migrations.** Schema is `Base.metadata.create_all()` at
   startup. The schema was expected to churn during development, and a
   migration tool would have been pure friction. **This is the main
   production gap**: deploying a schema change to an environment with real
-  data requires a manual migration path that does not exist yet.
+  data requires a manual migration path that does not exist yet. Concrete
+  example already in the schema: `contradictions.cosine` was added as a
+  nullable column purely so `create_all()` picks it up automatically in
+  dev — a real deployment with existing rows would need an explicit
+  `ALTER TABLE ... ADD COLUMN cosine DOUBLE PRECISION` (or equivalent)
+  applied by hand, since there's no migration tool to generate and run one.
 - **PDF blocks carry no section_path.** pdfplumber gives no structural
   heading markup the way DOCX styles or Markdown `#` do, so PDF citations
   are page-only (`policy.pdf · p.2`) rather than page+section. Font-size

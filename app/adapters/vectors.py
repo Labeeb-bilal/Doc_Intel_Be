@@ -20,7 +20,7 @@ _CHUNK_ID_NAMESPACE = uuid.NAMESPACE_URL
 @lru_cache
 def get_qdrant_client() -> AsyncQdrantClient:
     settings = get_settings()
-    return AsyncQdrantClient(url=settings.qdrant_url)
+    return AsyncQdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
 
 
 def compute_chunk_id(document_id: uuid.UUID, ordinal: int) -> uuid.UUID:
@@ -45,8 +45,6 @@ async def ensure_collection(collection_name: str) -> None:
             collection_name=collection_name,
             vectors_config=models.VectorParams(size=VECTOR_SIZE, distance=models.Distance.COSINE),
         )
-    # Delete-by-filter and scoped search both depend on this index existing.
-    # Creating an index that already exists is a no-op in Qdrant.
     await client.create_payload_index(
         collection_name=collection_name,
         field_name="document_id",
