@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     # None for the local docker-compose Qdrant (no auth); Qdrant Cloud
     # requires this.
     qdrant_api_key: str | None = None
+    qdrant_timeout_seconds: int = Field(default=30)
 
     storage_backend: Literal["local", "s3"] = Field(default="local")
     storage_local_path: str = Field(default="./storage")

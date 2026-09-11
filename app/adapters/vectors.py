@@ -20,7 +20,11 @@ _CHUNK_ID_NAMESPACE = uuid.NAMESPACE_URL
 @lru_cache
 def get_qdrant_client() -> AsyncQdrantClient:
     settings = get_settings()
-    return AsyncQdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+    return AsyncQdrantClient(
+        url=settings.qdrant_url,
+        api_key=settings.qdrant_api_key,
+        timeout=settings.qdrant_timeout_seconds,
+    )
 
 
 def compute_chunk_id(document_id: uuid.UUID, ordinal: int) -> uuid.UUID:
